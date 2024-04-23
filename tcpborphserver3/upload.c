@@ -42,6 +42,8 @@
 struct katcp_dispatch *g_client_dispatch = NULL; 
 
 /*****************************************************************************************/
+
+// Check for an Intel device
 int is_intel_fpga()
 {
     struct stat st;
@@ -65,6 +67,7 @@ int is_intel_fpga()
     return 0; // Otherwise assume not Intel
 }
 
+// Check for a gzip file by looking at the first two characters
 int is_gzipped_file(const char *path)
 {
     FILE *f = fopen(path, "rb");
