@@ -53,4 +53,8 @@ Project specific code, requring particular gateware and instruments:
 Disregard:
 
   wops        - (incomplete & ignore)
-  wss         - 
+  wss         -
+
+Edit: 5/5/25
+This is the Intel branch. This is the first attempt at porting over tcpborphserver3 onto an Intel device (a DE10-nano).
+Functionality should appear the same. Changes will be described shortly.
