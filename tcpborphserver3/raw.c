@@ -2017,6 +2017,7 @@ int progdev_resume(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
 
 int progdev_cmd(struct katcp_dispatch *d, int argc)
 {
+  fprintf(stderr, "DEBUG: In progdev_cmd\n");
   char *file;
   struct bof_state *bs;
   struct tbs_raw *tr;
@@ -2026,7 +2027,8 @@ int progdev_cmd(struct katcp_dispatch *d, int argc)
   struct katcp_job *j;
   struct katcp_notice *nx;
   char *argv[3];
-
+  fprintf(stderr, "DEBUG: d = %p in progdev_cmd\n", (void*)d);
+  
   tr = get_mode_katcp(d, TBS_MODE_RAW);
   if(tr == NULL){
     log_message_katcp(d, KATCP_LEVEL_FATAL, NULL, "unable to acquire state");

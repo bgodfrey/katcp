@@ -901,6 +901,7 @@ int call_katcp(struct katcp_dispatch *d)
 
   str = arg_string_katcl(d->d_line, 0);
   n = arg_count_katcl(d->d_line);
+  fprintf(stderr, "KATCP command received: %s\n", str);
   r = KATCP_RESULT_FAIL;
 
   if(d->d_current){

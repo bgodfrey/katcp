@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+#define __ARM_ARCH_8A
+#define FPGA_MANAGER_FW "/sys/class/fpga_manager/fpga0/firmware"
+#define FPGA_MANAGER_UPLOAD_FILE "/lib/firmware/blink_hps.rbf"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -31,12 +34,54 @@
 #define UPLOAD_LABEL      "upload"
 
 #define UPLOAD_TIMEOUT    30
-#define UPLOAD_PORT       7146
+#define UPLOAD_PORT       7147
 
 #define FPG_HEADER 589377378
 #define BOF_HEADER 423776070
 
+struct katcp_dispatch *g_client_dispatch = NULL; 
+
 /*****************************************************************************************/
+int is_intel_fpga()
+{
+    struct stat st;
+
+    // First check sysfs
+    if (stat("/sys/class/fpga_manager/fpga0", &st) == 0) {
+        return 1;
+    }
+
+    // Fall back to device tree check
+    FILE *f = fopen("/proc/device-tree/compatible", "rb");
+    if (f) {
+        char buffer[256];
+        fread(buffer, 1, sizeof(buffer)-1, f);
+        fclose(f);
+        buffer[sizeof(buffer)-1] = '\0';
+        if (strstr(buffer, "altr,socfpga"))
+            return 1;
+    }
+
+    return 0; // Otherwise assume not Intel
+}
+
+int is_gzipped_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return 0; // Assume not gzipped if can't open
+    }
+
+    unsigned char magic[2];
+    if (fread(magic, 1, 2, f) != 2) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    return (magic[0] == 0x1f && magic[1] == 0x8b);
+}
+
 
 void destroy_port_data_tbs(struct katcp_dispatch *d, struct tbs_port_data *pd, int error)
 {
@@ -107,6 +152,22 @@ struct tbs_port_data *create_port_data_tbs(struct katcp_dispatch *d, char *file,
   pd->t_del = delete;
 
   pd->t_name = strdup(file);
+
+  char temp_name[PATH_MAX];
+  snprintf(temp_name, sizeof(temp_name), "/lib/firmware/%s", pd->t_name);
+  free(pd->t_name);
+  
+  // Save the short name before modifying pd->t_name
+  char *short_name = strdup(file);   // <- save "blink_hps.rbf" or "gateware"
+  //pd->t_name = strdup(temp_name);
+  if (file[0] == '/') {
+    pd->t_name = strdup(file);  // absolute path, keep as-is
+  } else {
+    char temp_name[PATH_MAX];
+    snprintf(temp_name, sizeof(temp_name), "/lib/firmware/%s", file);
+    pd->t_name = strdup(temp_name);
+  }
+
   if(pd->t_name == NULL){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "allocation failure while duplicating %s", file);
     destroy_port_data_tbs(d, pd, 1);
@@ -130,138 +191,182 @@ struct tbs_port_data *create_port_data_tbs(struct katcp_dispatch *d, char *file,
 
 int subprocess_upload_tbs(struct katcl_line *l, void *data)
 {
-  /* TODO: once kcpfpg does gzopen, this should only decompress if format is BIN ? */
+    struct tbs_port_data *pd;
+    int lfd, nfd, rr, wr, have;
+    unsigned char buf[MTU];
+    unsigned int count = 0;
+    gzFile gfd;
+    FILE *out = NULL;
+    FILE *fpga_man = NULL;
+    char compressed_path[PATH_MAX];
+    char decompressed_path[PATH_MAX];
+    char firmware_file[PATH_MAX];
+    int skipping_metadata = 1;
 
-  struct tbs_port_data *pd;
-  int lfd, nfd, rr, wr, have;
-  unsigned char buf[MTU];
-  unsigned int count;
-  gzFile gfd;
-#ifdef __ARM_ARCH_8A
-  FILE *fpga_man;
-#endif
+    pd = data;
+    fprintf(stderr, "DEBUG: subprocess_upload_tbs() called\n");
 
-  pd = data;
-
-  if (pd == NULL){
-    sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "no state supplied to subordinate logic");
-    return -1;
-  }
-
-  lfd = net_listen(NULL, pd->t_port, 0);
-  if (lfd < 0){
-    sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "unable to bind port %d: %s", pd->t_port, strerror(errno));
-    return -1;
-  }
-
-  signal(SIGALRM, SIG_DFL);
-  alarm(pd->t_timeout);
-
-  nfd = accept(lfd, NULL, 0);
-  close(lfd);
-
-  if(nfd < 0){
-    sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "accept on port %d failed: %s", pd->t_port, strerror(errno));
-    return -1;
-  }
-
-  gfd = gzdopen(nfd, "r");
-  if(gfd == NULL){
-    close(nfd);
-    sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "gzdopen on network data stream failed: %s", strerror(errno));
-    return -1;
-  }
-
-  count = 0;
-
-  for (;;){
-    rr = gzread(gfd, buf, MTU);
-    if (rr == 0){
-      break;
-    } else if (rr < 0){
-      sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "read failed while receiving %s", strerror(errno));
-      gzclose(gfd);
-      return -1;
+    if (!pd) {
+        sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "no state supplied");
+        return -1;
     }
 
-    have = 0;
-    do {
-      wr = write(pd->t_fd, buf + have, rr - have);
-      switch(wr){
+    fprintf(stderr, "\tDEBUG: Calling net_listen\n");
+    fprintf(stderr, "\tDEBUG: net_listen about to bind to port %d\n", pd->t_port);
+    lfd = net_listen(NULL, pd->t_port, 0);
+    if (lfd < 0) {
+      fprintf(stderr, "\tDEBUG: net_listen failed: %s\n", strerror(errno));  
+      sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "net_listen failed: %s", strerror(errno));
+        return -1;
+    }
 
-        case -1:
-          switch(errno){
-            case EAGAIN:
-            case EINTR:
-              break;
-            default:
-              sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "saving of network stream to file failed: %s", strerror(errno));
-              gzclose(gfd);
-              return -1;
-          }
-          break;
+    fprintf(stderr, "\tDEBUG: Calling signal\n");
+    signal(SIGALRM, SIG_DFL);
+    fprintf(stderr, "\tDEBUG: Calling alarm\n");
+    alarm(pd->t_timeout);
 
-        case 0:
-          sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "unexpected zero write");
-          gzclose(gfd);
-          return -1;
+    fprintf(stderr, "\tDEBUG: Calling accept\n");
+    nfd = accept(lfd, NULL, 0);
+    fprintf(stderr, "\tDEBUG: Calling close\n");
+    close(lfd);
+    if (nfd < 0) {
+        sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "accept failed: %s", strerror(errno));
+        return -1;
+    }
 
-        default:
-          have += wr;
-#if 0
-          sync_message_katcl(l, KATCP_LEVEL_DEBUG, NULL, "%s: wrote %d bytes to parent", __func__, wr);
-#endif
-          break;
+    fprintf(stderr, "\tDEBUG: Opening compressed data\n");
+    gfd = gzdopen(nfd, "r");
+    if (!gfd) {
+        close(nfd);
+        sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "gzdopen failed: %s", strerror(errno));
+        return -1;
+    }
+
+    //snprintf(compressed_path, sizeof(compressed_path), "/lib/firmware/%s", basename(pd->t_name));
+    /*
+    if (is_intel_fpga()) {
+      fprintf(stderr, "\tDEBUG: Intel FPGA detected — renaming uploaded file to canonical name\n");       
+     
+      const char *original_path = pd->t_name;
+      const char *canonical_path = "/lib/firmware/tcpborphserver.fpg";
+
+      if (rename(original_path, canonical_path) != 0) {
+        fprintf(stderr, "\t\tDEBUG: Failed to rename to canonical path\n");
+        perror("rename to canonical .fpg name failed");
+        gzclose(gfd);
+        close(nfd);    
+        return -1;
       }
-    } while(have < rr);
 
-    count += rr;
+      fprintf(stderr, "\tDEBUG: Renamed %s to %s\n", original_path, canonical_path);
 
-#if 0
-    sync_message_katcl(l, KATCP_LEVEL_INFO, NULL, "uploaded %d bytes", pd->t_rsize);
-#endif
-
-    alarm(UPLOAD_TIMEOUT);
-  }
-
-  gzclose(gfd);
-
-  sync_message_katcl(l, KATCP_LEVEL_DEBUG, UPLOAD_LABEL, "received file data of %u bytes", count);
-
-  if(pd->t_expected > 0){
-    if(pd->t_expected != count){
-      sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "expected %u bytes but received %u", pd->t_expected, count);
-      return -1;
+      free(pd->t_name);  // Prevent memory leak
+      pd->t_name = strdup(canonical_path);  // So later code uses the right name
+      gzclose(gfd);
+      close(nfd);
+      //trigger_notice_katcp(g_client_dispatch, TBS_RAMFILE_PATH);
+      trigger_notice_katcp(g_client_dispatch, "/bin/kcpfpg_intel");
+      return 0;
     }
-  }
+    */
+   if (is_intel_fpga()) {
+    fprintf(stderr, "\tDEBUG: Intel FPGA detected — writing raw .fpg\n");
 
-#ifdef __ARM_ARCH_8A
-  /* Close file that we just finished writing to */
-  close(pd->t_fd);
+    const char *canonical_path = "/lib/firmware/tcpborphserver.fpg";
 
-  if(pd->t_program) {
-    fpga_man = fopen(FPGA_MANAGER_FLAG, "w");
-    if(fpga_man == NULL){
-      sync_message_katcl(l, KATCP_LEVEL_ERROR, NULL, "unable to open fpga manager flags");
-      return -1;
+    out = fopen(canonical_path, "wb");
+    if (!out) {
+        fprintf(stderr, "\t\tDEBUG: Could not open canoncial path\n");
+        perror("fopen canonical .fpg");
+        close(nfd);
+        return -1;
     }
-    fprintf(fpga_man, "0\n");
-    fclose(fpga_man);
 
+    while ((rr = read(nfd, buf, MTU)) > 0) {
+        if (fwrite(buf, 1, rr, out) != rr) {
+            perror("fwrite canonical .fpg");
+            fclose(out);
+            close(nfd);
+            return -1;
+        }
+        count += rr;
+    }
+
+    fclose(out);
+    close(nfd);
+
+    fprintf(stderr, "\tDEBUG: Wrote %u bytes to %s\n", count, canonical_path);
+
+    free(pd->t_name);
+    pd->t_name = strdup(canonical_path);
+
+    // Now that full file exists, trigger the .fpg handler
+    trigger_notice_katcp(g_client_dispatch, "/bin/kcpfpg_intel");
+    return 0;
+    }
+
+    else {
+        fprintf(stderr, "\tDEBUG: Xilinx/Other FPGA detected, saving file raw\n");
+
+        out = fopen(compressed_path, "wb");
+        if (!out) {
+            perror("fopen raw output");
+            gzclose(gfd);
+            return -1;
+        }
+
+        while ((rr = gzread(gfd, buf, MTU)) > 0) {
+            have = 0;
+            do {
+                wr = write(fileno(out), buf + have, rr - have);
+                if (wr > 0) {
+                    have += wr;
+                } else if (errno != EAGAIN && errno != EINTR) {
+                    perror("write raw output");
+                    fclose(out);
+                    gzclose(gfd);
+                    return -1;
+                }
+            } while (have < rr);
+            count += rr;
+        }
+
+        fclose(out);
+        gzclose(gfd);
+
+        snprintf(firmware_file, sizeof(firmware_file), "%s", basename(pd->t_name));
+    }
+
+    fprintf(stderr, "\tDEBUG: received %u bytes\n", count);
+    sync_message_katcl(l, KATCP_LEVEL_DEBUG, UPLOAD_LABEL, "received %u bytes", count);
+
+    if (pd->t_expected > 0 && pd->t_expected != count) {
+        fprintf(stderr, "\tDEBUG: expected %u bytes but received %u \n", pd->t_expected, count);
+        sync_message_katcl(l, KATCP_LEVEL_ERROR, UPLOAD_LABEL, "expected %u bytes but received %u", pd->t_expected, count);
+        return -1;
+    }
+
+    // Tell FPGA Manager what file to load
+    fprintf(stderr, "\tDEBUG: Opened FPGA Manager\n");
     fpga_man = fopen(FPGA_MANAGER_FW, "w");
-    if(fpga_man == NULL){
-      sync_message_katcl(l, KATCP_LEVEL_ERROR, NULL, "unable to open firmware file to write bitstream name");
-      return -1;
+    if (!fpga_man) {
+        perror("fopen FPGA_MANAGER_FW");
+        return -1;
     }
-    fprintf(fpga_man, "tcpborphserver.bin\n");
+    fprintf(fpga_man, "%s\n", firmware_file);
     fclose(fpga_man);
-  }
-#endif
+    fprintf(stderr, "\tDEBUG: Closed FPGA Manager\n");
 
-  alarm(0);
+    //send_katcp(l, KATCP_FLAG_FIRST | KATCP_FLAG_STRING | KATCP_FLAG_LAST, "#fpga", "ready");
+    //fprintf(stderr, "DEBUG: Sent KATCP flags\n");
 
-  return 0;
+    alarm(0);
+    fprintf(stderr, "\tDEBUG: Alarm called\n");
+    //sync_message_katcl(l, KATCP_LEVEL_INFO, UPLOAD_LABEL, "fpga programming complete via FPGA manager");
+    fprintf(stderr, "\tDEBUG: Leaving subprocess_upload_tbs\n");
+    return 0;
 }
+
 
 int transfer_status_tbs(struct katcp_dispatch *d, struct katcp_notice *n)
 {
@@ -305,10 +410,10 @@ int transfer_status_tbs(struct katcp_dispatch *d, struct katcp_notice *n)
 
 int upload_generic_resume_tbs(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
 {
+  fprintf(stderr, "DEBUG: upload_generic_resume_tbs called with notice name = %s\n", n->n_name);
   int result;
-
   result = transfer_status_tbs(d, n);
-
+  fprintf(stderr, "DEBUG: result from transfer status is %u\n", result);
   prepend_reply_katcp(d);
   append_string_katcp(d, KATCP_FLAG_LAST, (result == 0) ? KATCP_OK : KATCP_FAIL);
 
@@ -338,8 +443,14 @@ int detect_file_tbs(struct katcp_dispatch *d, char *name, int fd)
   char buffer[BUFFER];
   char bofmagic[4] = { 0x19, 'B', 'O', 'F' };
 
-  /* TODO - use gzopen */
+  if (name && strlen(name) > 4 && !strcmp(name + strlen(name) - 4, ".rbf")) {
+    fprintf(stderr, "DEBUG: Discovered that this is an .rbf file\n");
+    log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "detected rbf file by extension");
+    return TBS_FORMAT_RBF;
+  }
 
+  /* TODO - use gzopen */
+  fprintf(stderr, "DEBUG: Checking file type\n");
   if(fd < 0){
     if(name == NULL){
       log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "no file given to examine");
@@ -375,6 +486,7 @@ int detect_file_tbs(struct katcp_dispatch *d, char *name, int fd)
 
   if(!strncmp(buffer, bofmagic, 4)){
     log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "detected bof file");
+    fprintf(stderr, "DEBUG: Discovered that this is a .bin file\n");
     return TBS_FORMAT_BOF;
   }
 
@@ -385,11 +497,13 @@ int detect_file_tbs(struct katcp_dispatch *d, char *name, int fd)
 
   if(!strncmp(buffer, "#!", 2)){
     if(strstr(buffer, TBS_KCPFPG_EXE)){
+      fprintf(stderr, "DEBUG: Discovered that this is an .fpg file\n");
       log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "detected fpg file");
       return TBS_FORMAT_FPG;
     }
   }
 
+  fprintf(stderr, "DEBUG: Discovered that this is an unknown file\n");
   log_message_katcp(d, KATCP_LEVEL_WARN, NULL, "unknown file format");
 
   return TBS_FORMAT_BAD;
@@ -401,6 +515,7 @@ int detect_file_tbs(struct katcp_dispatch *d, char *name, int fd)
 
 int upload_filesystem_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
 {
+  fprintf(stderr, "DEBUG: upload_filesystem_complete_tbs was called");
   struct tbs_port_data *pd;
   int result;
 
@@ -413,6 +528,8 @@ int upload_filesystem_complete_tbs(struct katcp_dispatch *d, struct katcp_notice
     return -1;
   }
 
+  fprintf(stderr, "DEBUG: upload_filesystem_complete_tbs got data");
+
   result = transfer_status_tbs(d, n);
 
   log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "transfer of %s %s", pd->t_name, (result < 0) ? "failed" : "succeeded");
@@ -424,6 +541,7 @@ int upload_filesystem_complete_tbs(struct katcp_dispatch *d, struct katcp_notice
 
 int upload_filesystem_cmd(struct katcp_dispatch *d, int argc)
 {
+  fprintf(stderr, "DEBUG: upload_filesystem_cmd was called");
   struct katcp_dispatch *dl;
   struct katcp_job *j;
   struct katcp_url *url;
@@ -500,7 +618,8 @@ int upload_filesystem_cmd(struct katcp_dispatch *d, int argc)
     free(buffer);
     return KATCP_RESULT_FAIL;
   }
-
+  
+  fprintf(stderr, "DEBUG: Creating katcp notice\n");
   nx = create_notice_katcp(d, buffer, 0);
   if(nx == NULL){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to create notification logic to trigger when upload completes");
@@ -529,6 +648,7 @@ int upload_filesystem_cmd(struct katcp_dispatch *d, int argc)
     return KATCP_RESULT_FAIL;
   }
 
+  fprintf(stderr, "DEBUG: Running upload_to_ram_and_program logic for %s\n", pd->t_name);
   url = create_exec_kurl_katcp("upload");
   if (url == NULL){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "%s: could not create kurl", __func__);
@@ -719,6 +839,8 @@ int upload_bin_cmd(struct katcp_dispatch *d, int argc)
 
 int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
 {
+  fprintf(stderr, "DEBUG: Entered upload_program_complete_tbs\n");
+  fprintf(stderr, "\tDEBUG: upload_program_complete_tbs d = %p\n", (void*)d);
   struct tbs_port_data *pd;
 
   pd = data;
@@ -731,12 +853,35 @@ int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n
   }
 
   destroy_port_data_tbs(d, pd, 0);
+  fprintf(stderr, "\tDEBUG: Got rid of port data\n");
+  
+  if (is_intel_fpga()) {
+        fprintf(stderr, "\tDEBUG: Intel FPGA detected, sending !progremote ok\n");
+        prepend_reply_katcp(g_client_dispatch);
+        append_string_katcp(g_client_dispatch, KATCP_FLAG_LAST, KATCP_OK);
+        fprintf(stderr, "\tDEBUG: d = %p before resume_katcp\n", (void*)d);
+        //send_katcp(d, KATCP_FLAG_FIRST | KATCP_FLAG_LAST | KATCP_FLAG_STRING,  "!progremote", KATCP_OK);
+        //send_katcp(d, KATCP_FLAG_FIRST | KATCP_FLAG_LAST | KATCP_FLAG_STRING,  "!progremote", KATCP_OK);
+        //fprintf(stderr, "\tDEBUG: Sent !progremote ok — now calling resume_katcp\n");
+        //fprintf(stderr, "\tDEBUG: Sent !progremote ok\n");
+
+        fprintf(stderr, "\tDEBUG: Called resume_katcp(), command should now complete\n");
+        //send_katcp(g_client_dispatch, KATCP_FLAG_FIRST | KATCP_FLAG_LAST | KATCP_FLAG_STRING, "#fpga", "ready"); 
+        send_katcp(g_client_dispatch,
+          KATCP_FLAG_FIRST | KATCP_FLAG_STRING, "#fpga",
+          KATCP_FLAG_LAST  | KATCP_FLAG_STRING, "ready");
+      
+        resume_katcp(g_client_dispatch);
+
+        //return KATCP_RESULT_OK;
+    }
 
   return 0;
 }
 
 int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
 {
+  //fprintf(stderr, "DEBUG: Called upload program partial\n");
   struct tbs_port_data *pd;
   struct bof_state *bs;
   struct katcp_job *j;
@@ -746,6 +891,9 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
   char *argv[3];
 
   pd = data;
+  fprintf(stderr, "DEBUG: ENTERED upload_program_partial_tbs, t_name = %s\n", pd->t_name);
+  fprintf(stderr, "\tDEBUG: Checking for null data\n");
+
   if(pd == NULL){
 #ifdef KATCP_CONSISTENCY_CHECKS
     fprintf(stderr, "logic problem: no port data given to handler\n");
@@ -753,6 +901,8 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
 #endif
     return -1;
   }
+ 
+  fprintf(stderr, "\tDEBUG: Checking for null name\n");
 
   if(pd->t_name == NULL){
 #ifdef KATCP_CONSISTENCY_CHECKS
@@ -762,27 +912,36 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
     return -1;
   }
 
-  result = transfer_status_tbs(d, n);
-  if(result < 0){
-    destroy_port_data_tbs(d, pd, 1);
-    return -1;
-  }
-
-  nx = find_notice_katcp(d, TBS_KCPFPG_PATH);
-  if(nx){
-    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "not proceeding with programming as another instance is already in flight");
-    destroy_port_data_tbs(d, pd, 1);
-    return -1;
-  }
-
-  if(stop_fpga_tbs(d) < 0){
-    destroy_port_data_tbs(d, pd, 1);
-    return -1;
-  }
+  fprintf(stderr, "\tDEBUG: Checking file type of %s\n", pd->t_name);
 
   type = detect_file_tbs(d, pd->t_name, pd->t_fd);
+  fprintf(stderr, "\tDEBUG: Detected file type is %d\n", type);
   switch(type){
     case TBS_FORMAT_BOF :
+    
+      fprintf(stderr, "\tDEBUG: Calling transfer status tbs for BOF file\n");
+
+      result = transfer_status_tbs(d, n);
+      if(result < 0){
+        destroy_port_data_tbs(d, pd, 1);
+        return -1;
+      }
+    
+      fprintf(stderr, "\tDEBUG: Finding katcp notice\n");
+      nx = find_notice_katcp(d, TBS_KCPFPG_PATH);
+      if(nx){
+        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "not proceeding with programming as another instance is already in flight");
+        destroy_port_data_tbs(d, pd, 1);
+        return -1;
+      }
+    
+      fprintf(stderr, "\tDEBUG: Checking if stop fpga tbs\n");
+    
+      if(stop_fpga_tbs(d) < 0){
+        destroy_port_data_tbs(d, pd, 1);
+        return -1;
+      }
+    
 
       log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "processing upload as bof format");
       result = (-1);
@@ -799,8 +958,110 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
       return result;
 
     case TBS_FORMAT_FPG :
+      fprintf(stderr, "\t\tDEBUG: Dispatch name is %s\n", pd->t_name);
+      if (is_intel_fpga()) {
+        fprintf(stderr, "\t\tDEBUG: Intel FPGA detected, handling .fpg via kcpfpg_intel\n");
+    
+        dl = template_shared_katcp(d);
+        if (!dl) {
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+    
+        struct katcp_notice *nx = create_notice_katcp(d, "/bin/kcpfpg_intel", 0);
+        if (!nx) {
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to create notice for kcpfpg_intel");
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+    
+        if (add_notice_katcp(d, nx, &upload_program_complete_tbs, pd) < 0) {
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to register callback for kcpfpg_intel completion");
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+    
+        char *argv[] = { "/bin/kcpfpg_intel", pd->t_name, NULL };
+        fprintf(stderr, "\t\tDEBUG: Starting child job: %s %s\n", argv[0], argv[1]);
+    
+        struct katcp_job *j = process_name_create_job_katcp(dl, "/bin/kcpfpg_intel", argv, nx, NULL);
+        if (!j) {
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "failed to launch kcpfpg_intel");
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+    
+        return 0;
+      }
+      else {
+        result = transfer_status_tbs(d, n);
+        if(result < 0){
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+        }
+      
+        fprintf(stderr, "\t\tDEBUG: Finding katcp notice\n");
+        nx = find_notice_katcp(d, TBS_KCPFPG_PATH);
+        if(nx){
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "not proceeding with programming as another instance is already in flight");
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+        }
+      
+        fprintf(stderr, "\t\tDEBUG: Checking if stop fpga tbs\n");
+      
+        if(stop_fpga_tbs(d) < 0){
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+        }
+        fprintf(stderr, "\t\tDEBUG: Found an .fpg file\n");
 
-      log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "assuming new fpg format for %s", pd->t_name);
+        log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "assuming new fpg format for %s", pd->t_name);
+        
+        fprintf(stderr, "\t\tDEBUG: Creating shared katcp template\n");
+
+        dl = template_shared_katcp(d);
+        if(dl == NULL){
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+      
+        fprintf(stderr, "\t\tDEBUG: Creating katcp notice\n");
+
+        nx = create_notice_katcp(d, TBS_KCPFPG_PATH, 0);
+        if(nx == NULL){
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to create notification logic to trigger when %s completes", TBS_KCPFPG_PATH);
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+        }
+
+        fprintf(stderr, "\t\tDEBUG: Checking for completion of upload program\n");
+
+        if(add_notice_katcp(d, nx, &upload_program_complete_tbs, pd) < 0){
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to register callback to resume command");
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+        }
+
+        argv[0] = TBS_KCPFPG_PATH;
+        argv[1] = pd->t_name;
+        argv[2] = NULL;
+        
+        fprintf(stderr, "\t\tDEBUG: job name = %s\n", argv[0]);  // Must be tcpborphserver.bin
+        j = process_name_create_job_katcp(dl, TBS_KCPFPG_PATH, argv, nx, NULL);
+        if (j == NULL){
+          log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to run %s child process", TBS_KCPFPG_PATH);
+  #if 1
+          destroy_port_data_tbs(d, pd, 1);
+  #endif
+          return -1;
+        }
+
+        return 0;
+      }  
+    /*
+    case TBS_FORMAT_RBF:
+      fprintf(stderr, "\t\tDEBUG: Found an .rbf file\n");
 
       dl = template_shared_katcp(d);
       if(dl == NULL){
@@ -808,15 +1069,19 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
         return KATCP_RESULT_FAIL;
       }
 
-      nx = create_notice_katcp(d, TBS_KCPFPG_PATH, 0);
+      // Match dispatch name to expected path
+      const char *dispatch_name = TBS_KCPFPG_PATH;
+
+      fprintf(stderr, "\t\tDEBUG: Creating katcp notice for %s\n", dispatch_name);
+      nx = create_notice_katcp(d, dispatch_name, 0);
       if(nx == NULL){
-        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to create notification logic to trigger when %s completes", TBS_KCPFPG_PATH);
+        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to create notification logic for %s", dispatch_name);
         destroy_port_data_tbs(d, pd, 1);
         return -1;
       }
 
       if(add_notice_katcp(d, nx, &upload_program_complete_tbs, pd) < 0){
-        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to register callback to resume command");
+        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to register callback");
         destroy_port_data_tbs(d, pd, 1);
         return KATCP_RESULT_FAIL;
       }
@@ -824,22 +1089,66 @@ int upload_program_partial_tbs(struct katcp_dispatch *d, struct katcp_notice *n,
       argv[0] = TBS_KCPFPG_PATH;
       argv[1] = pd->t_name;
       argv[2] = NULL;
-
-      j = process_name_create_job_katcp(dl, TBS_KCPFPG_PATH, argv, nx, NULL);
-      if (j == NULL){
-        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to run %s child process", TBS_KCPFPG_PATH);
-#if 1
+      fprintf(stderr, "\t\tDEBUG: Child will exec: %s %s\n", argv[0], argv[1]);
+      fprintf(stderr, "\t\tDEBUG: Starting job %s\n", argv[0]);
+      j = process_name_create_job_katcp(dl, dispatch_name, argv, nx, NULL);
+      if(j == NULL){
+        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to start child job");
         destroy_port_data_tbs(d, pd, 1);
-#endif
         return -1;
       }
 
+      fprintf(stderr, "\t\tDEBUG: Calling transfer status tbs\n");
+      result = transfer_status_tbs(d, nx);
+      if(result < 0){
+        fprintf(stderr, "\t\t\tDEBUG: Result < 0\n");
+        destroy_port_data_tbs(d, pd, 1);
+        return -1;
+      }
+      fprintf(stderr, "\t\tDEBUG:Returning from upload_program_partial_tbs\n");
       return 0;
+    */  
+    /*
+    case TBS_FORMAT_RBF:
+      fprintf(stderr, "\tDEBUG: Detected Intel .rbf upload. No Further programming required\n");
+      log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "detected Intel .rbf upload, no further programming required");
+      
+      dl = template_shared_katcp(d);
+      if (!dl) {
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+      }
+      fprintf(stderr, "\t\tDEBUG: creating notice for progremote\n");
+      fprintf(stderr, "\t\tDEBUG: dl = %p, d = %p\n", (void*)dl, (void*)d);
+      
+      
+      nx = create_notice_katcp(d, "progremote", 0);  // tie this job to ?progremote
+      if (!nx) {
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+      }
 
+      if (add_notice_katcp(d, nx, &upload_program_complete_tbs, pd) < 0) {
+          destroy_port_data_tbs(d, pd, 1);
+          return KATCP_RESULT_FAIL;
+      }
+      
+      // Spawn a dummy child process that finishes immediately
+      char *argv[] = { "/bin/true", NULL };  // dummy success command
+      fprintf(stderr, "\t\tDEBUG: creating dummy child job\n");
+      j = process_name_create_job_katcp(d, "progremote", argv, nx, NULL);
+      if (!j) {
+          destroy_port_data_tbs(d, pd, 1);
+          return -1;
+      }
+
+      return 0;    
+    */
     default :
+      fprintf(stderr, "DEBUG: Katcp error - was sent unusable or invalid format\n");
       log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "was sent unusable or invalid format");
       destroy_port_data_tbs(d, pd, 1);
-      return -1;
+    return -1;
   }
 
 }
@@ -1000,6 +1309,9 @@ int progremote_tbs(struct katcl_line *l, void *data)
 
 int upload_program_cmd(struct katcp_dispatch *d, int argc)
 {
+  g_client_dispatch = d;
+  fprintf(stderr, "DEBUG: upload_program_cmd called\n");
+  fprintf(stderr, "\tDEBUG: upload_program_cmd d = %p\n", (void*)d);
   struct katcp_dispatch *dl;
   struct katcp_job *j;
   struct katcp_url *url;
@@ -1026,7 +1338,7 @@ int upload_program_cmd(struct katcp_dispatch *d, int argc)
   expected = 0;
   timeout = 0;
   port = UPLOAD_PORT;
-
+  fprintf(stderr, "\tDEBUG: Listening on port %u\n", port);
   if(argc > 1){
     port = arg_unsigned_long_katcp(d, 1);
     if(sane_port_tbs(d, port) < 0){
@@ -1093,6 +1405,13 @@ int upload_program_cmd(struct katcp_dispatch *d, int argc)
     return KATCP_RESULT_FAIL;
   }
 #endif
+  if (is_intel_fpga()) {
+    const char *canonical_fpg = "/lib/firmware/tcpborphserver.fpg";
+    fprintf(stderr, "\tDEBUG: Intel FPGA — renaming %s to %s\n", pd->t_name, canonical_fpg);
+    rename(pd->t_name, canonical_fpg);
+    free(pd->t_name);
+    pd->t_name = strdup(canonical_fpg);
+  }
   j = run_child_process_tbs(dl, url, &subprocess_upload_tbs, pd, nx);
   if (j == NULL){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to run child process");
@@ -1102,8 +1421,20 @@ int upload_program_cmd(struct katcp_dispatch *d, int argc)
   }
 
   log_message_katcp(d, KATCP_LEVEL_INFO, NULL, "awaiting transfer on port %d", pd->t_port);
+  fprintf(stderr, "\tDEBUG: Determining flow path\n");
+  if (is_intel_fpga()) {
+    fprintf(stderr, "\tDEBUG: Intel FPGA detected, using FPGA Manager flow\n");
+    log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "Intel FPGA, returning KATCP_RESULT_OK");
 
+    return KATCP_RESULT_OK; 
+  }
+
+  fprintf(stderr, "\tDEBUG: Launching child process subprocess_upload_tbs\n");
+  fprintf(stderr, "\tDEBUG: Xilinx FPGA detected, resuming normal direct flow\n");
+  //log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "Non-Intel FPGA, assuming direct flow");
   return KATCP_RESULT_OK;
+  
+
 }
 
 

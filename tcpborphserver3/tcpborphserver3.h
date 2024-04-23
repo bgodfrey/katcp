@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#include <katcp.h>
+#include <../katcp/katcp.h>
 #include <avltree.h>
 
 #define TBS_MAX_CLIENTS    32
@@ -38,7 +38,9 @@
 #endif
 
 #define TBS_KCPFPG_PATH    "/bin/kcpfpg"
-#define TBS_RAMFILE_PATH   "/dev/shm/gateware"
+
+//#define TBS_RAMFILE_PATH   "/dev/shm/gateware"
+#define INTEL_FPGA 1
 
 #define TBS_FPGA_STATUS    "#fpga"
 #define TBS_KCPFPG_EXE     "kcpfpg"
@@ -278,6 +280,7 @@ void destroy_hwsensor_tbs(void *data);
 #define TBS_FORMAT_BOF   1
 #define TBS_FORMAT_FPG   2
 #define TBS_FORMAT_BIN   3
+#define TBS_FORMAT_RBF   4
 
 #define TBS_DEL_NEVER  0
 #define TBS_DEL_ERROR  1
@@ -340,4 +343,14 @@ int post_hook_led_cmd(struct katcp_dispatch *d, int argc);
 struct katcp_arb *chassis_init_tbs(struct katcp_dispatch *d, char *name);
 
 
+#endif
+
+#ifndef TBS_RAMFILE_PATH
+  #ifdef INTEL_FPGA
+    #define TBS_RAMFILE_PATH "/lib/firmware/tcpborphserver.rbf"
+    #define TBS_KCPFPG_EXE "kcpfpg_intel"
+    #define TBS_KCPFPG_PATH "/bin/kcpfpg_intel"
+  #else
+    #define TBS_RAMFILE_PATH "/dev/shm/gateware"
+  #endif
 #endif

@@ -72,6 +72,10 @@ struct katcp_job *run_child_process_tbs(struct katcp_dispatch *d, struct katcp_u
   }
 
   pid = fork();
+  if(pid == 0){
+    fprintf(stderr, "DEBUG: child process forked, about to call subprocess_upload_tbs\n");
+  }
+
   if(pid < 0){
     close(fds[0]);
     close(fds[1]);
