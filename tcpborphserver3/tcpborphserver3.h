@@ -37,13 +37,13 @@
 #define TBS_FPGA_MEM       "/dev/mem"
 #endif
 
-#define TBS_KCPFPG_PATH    "/bin/kcpfpg"
+//#define TBS_KCPFPG_PATH    "/bin/kcpfpg"
 
 //#define TBS_RAMFILE_PATH   "/dev/shm/gateware"
 #define INTEL_FPGA 1
 
 #define TBS_FPGA_STATUS    "#fpga"
-#define TBS_KCPFPG_EXE     "kcpfpg"
+//#define TBS_KCPFPG_EXE     "kcpfpg"
 
 #define TBS_ROACH_CHASSIS  "roach2chassis"
 
@@ -347,7 +347,7 @@ struct katcp_arb *chassis_init_tbs(struct katcp_dispatch *d, char *name);
 
 #ifndef TBS_RAMFILE_PATH
   #ifdef INTEL_FPGA
-    #define TBS_RAMFILE_PATH "/lib/firmware/tcpborphserver.rbf"
+    #define TBS_RAMFILE_PATH "/lib/firmware/tcpborphserver.fpg"
     #define TBS_KCPFPG_EXE "kcpfpg_intel"
     #define TBS_KCPFPG_PATH "/bin/kcpfpg_intel"
   #else

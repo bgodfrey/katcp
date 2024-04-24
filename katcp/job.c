@@ -1728,7 +1728,7 @@ struct katcp_job *find_containing_job_katcp(struct katcp_dispatch *d, char *name
 
 struct katcp_job *process_name_create_job_katcp(struct katcp_dispatch *d, char *cmd, char **argv, struct katcp_notice *halt, struct katcp_notice *relay)
 {
-  fprintf(stderr 'DEBUG: Creating a katcp job\n');
+  fprintf(stderr, "DEBUG: Creating a katcp job\n");
   struct katcp_url *u;
   struct katcp_job *j;
 
