@@ -32,6 +32,7 @@
 #define flip32(a)     ((0xff & ((a) >> 24)) | (0xff00 & ((a) >> 8)) | (0xff0000 & ((a) << 8)) | (0xff000000 & ((a) << 24)))
 
 /*********************************************************************/
+extern int finalise_cmd(struct katcp_dispatch *d, int argc);
 
 static volatile int bus_error_happened;
 

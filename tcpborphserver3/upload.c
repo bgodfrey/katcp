@@ -924,9 +924,12 @@ int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n
 {
   fprintf(stderr, "DEBUG: Entered upload_program_complete_tbs\n");
   fprintf(stderr, "\tDEBUG: upload_program_complete_tbs d = %p\n", (void*)d);
+  fprintf(stderr, "\tDEBUG: upload_program_complete_tbs g_client_dispatch = %p\n", (void*)g_client_dispatch);
+
   struct tbs_port_data *pd;
 
   pd = data;
+  fprintf(stderr, "DEBUG: upload_program_complete_tbs pd = %p\n", (void*)pd);
   if(pd == NULL){
 #ifdef KATCP_CONSISTENCY_CHECKS
     fprintf(stderr, "logic problem: no port data given to handler\n");
@@ -949,100 +952,108 @@ int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n
     fprintf(stderr, "\tDEBUG: g_client_dispatch = %p before resume_katcp\n", (void*)g_client_dispatch);
     resume_katcp(g_client_dispatch);  // <<< first flush
     fprintf(stderr, "\tDEBUG: Flushed !progremote ok\n");
-    
-    /* ── 2) Parse the .fpg header off disk ── */
-    struct ipr_state *ipr = calloc(1, sizeof(*ipr));
-    if (!ipr) {
-      fprintf(stderr, "DEBUG ERROR: out of memory allocating ipr_state\n");
+    template_shared_katcp(g_client_dispatch);
+
+      // argv for the “raw” mode
+    char *argv_raw[] = { "raw" };
+    if (setup_raw_tbs(g_client_dispatch,   // dispatch
+                      /*bofdir=*/NULL,     // not used for parse‐only
+                      /*argc=*/1,
+                      /*argv=*/argv_raw) < 0) {
+      fprintf(stderr, "ERROR: setup_raw_tbs failed\n");
+      pd->t_program = 0;
       return -1;
     }
-    /* … initialize ipr->i_fd, ipr->i_label, etc. … */
-
-    parse_fpg_header_katcp(g_client_dispatch, ipr, "/lib/firmware/tcpborphserver.fpg");
-    fprintf(stderr, "\tDEBUG: Parsed header: %zu registers, %zu metas\n", ipr->n_registers, ipr->n_metas);
-    //if (unlink("/lib/firmware/tcpborphserver.fpg") == 0) {
-    //  fprintf(stderr, "\tDEBUG: Unlinked /lib/firmware/tcpborphserver.fpg\n");
-    //} else { 
-    //  fprintf(stderr, "\tDEBUG: Failed to unlink /lib/firmware/tcpborphserver.fpg\n");
-    //  perror("\tERROR: Failed to unlink /lib/firmware/tcpborphserver.fpg");
-    //}
-    /* ── 3) Emit register informs ── */
-    char addr_hex[16], size_hex[16];
-    for (size_t i = 0; i < ipr->n_registers; i++) {
-      register_entry_t *e = &ipr->registers[i];
-      // format address and size as hex strings
-      snprintf(addr_hex, sizeof(addr_hex), "0x%X", e->addr);     
-      snprintf(size_hex, sizeof(size_hex), "0x%X", e->size); 
-      send_katcp(g_client_dispatch, KATCP_FLAG_FIRST  | KATCP_FLAG_STRING, "!register", KATCP_FLAG_STRING, e->name, KATCP_FLAG_STRING, addr_hex, KATCP_FLAG_LAST   | KATCP_FLAG_STRING,  size_hex);
-    }
-    fprintf(stderr, "DEBUG: Sent !register informs\n");
-
-    /* ── 4) Emit meta informs ── */
-    for (size_t j = 0; j < ipr->n_metas; j++) {
-      meta_entry_t *m = &ipr->metas[j];
-      send_katcp(g_client_dispatch, KATCP_FLAG_FIRST  | KATCP_FLAG_STRING, "!meta", KATCP_FLAG_STRING, m->key, KATCP_FLAG_LAST | KATCP_FLAG_STRING,  m->val);
-    }
-    fprintf(stderr, "\tDEBUG: Queued %zu !meta informs\n", ipr->n_metas);
-
-    /* ── 5) Finally, signal “we’re done” and flush everything ── */
-    send_katcp(g_client_dispatch, KATCP_FLAG_FIRST  | KATCP_FLAG_STRING, "#fpga", KATCP_FLAG_LAST   | KATCP_FLAG_STRING, "ready");
-    fprintf(stderr, "DEBUG: Sent fpga ready inform\n");
-
-    resume_katcp(g_client_dispatch);
-
-    fprintf(stderr, "\tDEBUG: Flushed !register/!meta/#fpga ready\n");
-/* replay the header back into the dispatch, exactly as fpg.c does */
-    FILE *hdr = fopen("/lib/firmware/tcpborphserver.fpg", "r");
-    if (hdr) {
-      fprintf(stderr, "\tDEBUG: Opened file for parsing\n");
-
-      char line[1024];
-      while (fgets(line, sizeof(line), hdr)) {
-        size_t len = strcspn(line, "\r\n");
-        line[len] = '\0';
-        if (line[0] == '\0' || line[0] == '#') {
-            continue;
-        }
-        if (!strncmp(line, "?quit", 5)) {
-            break;
-        }
-        /* 1) clear previous parse */
-        have_katcl(g_client_dispatch->d_line);
-        /* 2) load this ASCII command into the buffer */
-        if (load_katcl(g_client_dispatch->d_line, line, len) < 0) {
-          fprintf(stderr, "ERROR: load_katcl failed on '%s'\n", line);
-          continue;
-        }
-        /* 3) finalize the parse */
-        struct katcl_parse *msg = ready_katcl(g_client_dispatch->d_line);
-        if (!msg) {
-          fprintf(stderr, "ERROR: ready_katcl failed on '%s'", line);
-          continue;
-        }
-        /* 4) attach it and dispatch */
-        append_parse_katcl(g_client_dispatch->d_line, msg);
-        if (dispatch_katcp(g_client_dispatch) < 0) {
-          fprintf(stderr, "ERROR: dispatch_katcp failed on '%s'", line);
-        }
-        /* 4) invoke the handler you registered via template_shared_katcp() */
-      }
-        fclose(hdr);
-    }
-    else {
-      fprintf(stderr, "ERROR opening .fpg for replay\n");
-    }
-
+    /*Parse the .fpg header into that dispatch’s parser */
     
+    struct ipr_state *ipr = calloc(1, sizeof(*ipr));
+    fprintf(stderr, "DEBUG: Allocated space for ipr_state\n");
 
+    if (!ipr) {
+      pd->t_program = 0;
+      return -1;
+    }
+    parse_fpg_header_katcp(g_client_dispatch,
+                          ipr,
+                          pd->t_name);
+    fprintf(stderr, "DEBUG: Parsed the fpg header\n");
+    free(ipr);
+    FILE *hdr = fopen(pd->t_name, "r");
+    fprintf(stderr, "DEBUG: Open file %s\n", pd->t_name);
+    if(hdr) {
+      char line[1024];
+      fprintf(stderr, "DEBUG: Created a character array\n");
+      while(fgets(line, sizeof(line), hdr)) {
+        fprintf(stderr, "DEBUG: Examining line %s\n", line);
+        size_t L = strcspn(line, "\r\n");
+        line[L] = 0;
+        if(line[0]=='\0' || line[0]=='#' || !strncmp(line, "?quit",5)) {
+          if(!strncmp(line, "?quit",5)){ 
+            fprintf(stderr, "\tDEBUG: Found ?quit in line\n");
+            break;
+          }  
+          continue;
+        }
+        if(!strncmp(line, "?uploadbin", 10)) {
+          continue;
+        }  
+        if(strncmp(line, "?register",9) && strncmp(line, "?meta",5))
+        {
+          fprintf(stderr, "\tDEBUG: Didn't find ?register or ?meta in line\n");
+          continue;
+        }
+          
+        /* tabs → spaces so katcl tokenizes properly */
+        for(char *p = line; *p; p++){ 
+          if(*p=='\t') { 
+            *p=' ';
+          }
+        }  
+
+        have_katcl(  g_client_dispatch->d_line );
+        load_katcl(  g_client_dispatch->d_line, line, L );
+        struct katcl_parse *msg = ready_katcl(g_client_dispatch->d_line);
+        append_parse_katcl(g_client_dispatch->d_line, msg);
+        dispatch_katcp(g_client_dispatch);
+      }
+      fclose(hdr);
+    }
+    else
+    {
+      fprintf(stderr, "DEBUG: Could not open header %s\n", pd->t_name);
+      pd->t_program = 0;
+      return -1;
+    }
+      
+    //if (map_raw_tbs(g_client_dispatch) < 0) {
+    //  fprintf(stderr, "ERROR: map_raw_tbs failed, header not parsed\n");
+    //}
     /* mark the FPGA as programmed so ?listdev will work */
     pd->t_program = 1;
     fprintf(stderr, "\tDEBUG: Marked port_data as programmed (t_program=1)\n");
     
-    /* clean up */
-    free(ipr);
-    fprintf(stderr, "DEBUG: Freed up memory\n");
-    //return KATCP_RESULT_OK;
+    
+    /* 3) Flip the FPGA state so ?listdev will see it’s programmed */
+    status_fpga_tbs(g_client_dispatch, TBS_FPGA_PROGRAMMED);
+    fprintf(stderr, "\tDEBUG: Set status to programmed\n");
+
+    finalise_cmd(g_client_dispatch, 0);
+    fprintf(stderr, "\tDEBUG: Finalizing katcp commands\n");
+
+    // 4) Tell the client we’re done
+    //resume_katcp(g_client_dispatch);
+    send_katcp(g_client_dispatch, KATCP_FLAG_FIRST|KATCP_FLAG_STRING, "#fpga", KATCP_FLAG_LAST |KATCP_FLAG_STRING,  "ready");
+    fprintf(stderr, "\tDEBUG: Sent completion flags\n");
+    resume_katcp(g_client_dispatch);
+    resume_katcp(d);
+    fprintf(stderr,"DEBUG: Completed programming informs and fpga ready\n");
   }
+  else {
+    fprintf(stderr, "DEBUG: Not the Intel path\n");
+    destroy_port_data_tbs(d, pd, 0);
+    //destroy_port_data_tbs(g_client_dispatch, pd, 0);
+  }
+  //return KATCP_RESULT_OK;
   return 0;
 }
 
@@ -1542,6 +1553,7 @@ int upload_program_cmd(struct katcp_dispatch *d, int argc)
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "%s: couldn't create port data", __func__);
     return KATCP_RESULT_FAIL;
   }
+  fprintf(stderr, "DEBUG: upload_program_cmd pd = %p\n", (void*)pd);
 
   /* added in the global space dl, so that it completes even if client goes away */
   if(add_notice_katcp(dl, nx, &upload_program_partial_tbs, pd) < 0){
