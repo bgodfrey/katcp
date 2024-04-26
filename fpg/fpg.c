@@ -16,6 +16,12 @@
 #include <netdb.h>
 #include <fcntl.h>
 
+#include <avltree.h>
+#include <libgen.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <zlib.h>
+
 #include <sysexits.h>
 
 #include "katcl.h"
@@ -23,8 +29,8 @@
 #include "katpriv.h"
 
 #include "netc.h"
-#include <avltree.h>
 
+#define MTU 4096
 #define V6_FPGA_DEVICE_ID 0x004288093
 
 #define KCPFPG_LABEL      "kcpfpg"
@@ -41,6 +47,8 @@
 #define BINFILE_HEAD       132     /* require at least this much */
 
 #define CONNECT_ATTEMPTS   6
+int program_intel_rbf(char *fpg_file);
+int is_intel_fpga(void);
 
 struct ipr_state{
   int i_verbose;
@@ -64,6 +72,192 @@ struct ipr_state{
   unsigned int i_timeout;
 };
 
+// Check for an Intel device
+int is_intel_fpga()
+{
+    struct stat st;
+
+    // First check sysfs
+    if (stat("/sys/class/fpga_manager/fpga0", &st) == 0) {
+        return 1;
+    }
+
+    // Fall back to device tree check
+    FILE *f = fopen("/proc/device-tree/compatible", "rb");
+    if (f) {
+        char buffer[256];
+        fread(buffer, 1, sizeof(buffer)-1, f);
+        fclose(f);
+        buffer[sizeof(buffer)-1] = '\0';
+        if (strstr(buffer, "altr,socfpga"))
+            return 1;
+    }
+
+    return 0; // Otherwise assume not Intel
+}
+
+// Check for a gzip file by looking at the first two characters
+int is_gzipped_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return 0; // Assume not gzipped if can't open
+    }
+
+    unsigned char magic[2];
+    if (fread(magic, 1, 2, f) != 2) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    return (magic[0] == 0x1f && magic[1] == 0x8b);
+}
+
+int program_intel_rbf(char* fpg_file) {
+
+    const char *input_fpg = fpg_file;
+    struct stat st;
+
+    if (stat(input_fpg, &st) != 0) {
+        perror("stat on input .fpg failed");
+        return 1;
+    }
+
+    fprintf(stderr, "DEBUG KCPFPG_INTEL: launching on: %s\n", input_fpg);
+    fprintf(stderr, "DEBUG KCPFPG_INTEL: Input .fpg size: %ld bytes\n", st.st_size);
+
+    char buf[MTU];
+    char *base = basename((char *)input_fpg);
+    char compressed_path[PATH_MAX];
+    snprintf(compressed_path, sizeof(compressed_path), "/tmp/%s_payload.gz", base);
+
+    FILE *in = fopen(input_fpg, "rb");
+    if (!in) {
+        perror("fopen input .fpg");
+        return 1;
+    }
+
+    FILE *compressed_out = fopen(compressed_path, "wb");
+    if (!compressed_out) {
+        perror("fopen compressed output");
+        fclose(in);
+        return 1;
+    }
+
+    // Skip ASCII header until we find ?quit
+    char line[MTU];
+    long payload_offset = -1;
+    while (fgets(line, sizeof(line), in)) {
+        if (strncmp(line, "?quit", 5) == 0) {
+            payload_offset = ftell(in); // offset after newline following ?quit
+            break;
+        }
+    }
+
+    if (payload_offset < 0) {
+        fprintf(stderr, "ERROR: ?quit not found in .fpg file\n");
+        fclose(in);
+        fclose(compressed_out);
+        return 1;
+    }
+
+    fprintf(stderr, "DEBUG KCPFPG_INTEL: Found ?quit at offset %ld\n", payload_offset);
+
+    // Copy raw gzipped payload
+    fseek(in, payload_offset, SEEK_SET);
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, r, compressed_out);
+    }
+
+    fclose(in);
+    fclose(compressed_out);
+
+    // Now decompress the extracted gzip stream
+    gzFile compressed = gzopen(compressed_path, "rb");
+    if (!compressed) {
+        perror("gzopen decompress");
+        return 1;
+    }
+
+    char decompressed_path[PATH_MAX];
+    snprintf(decompressed_path, sizeof(decompressed_path), "/tmp/%s_decompressed.rbf", base);
+    FILE *decompressed = fopen(decompressed_path, "wb");
+    if (!decompressed) {
+        perror("fopen decompressed output");
+        gzclose(compressed);
+        return 1;
+    }
+
+    int rr;
+    while ((rr = gzread(compressed, buf, MTU)) > 0) {
+        if (fwrite(buf, 1, rr, decompressed) != (size_t)rr) {
+            perror("fwrite decompressed");
+            fclose(decompressed);
+            gzclose(compressed);
+            return 1;
+        }
+    }
+
+    if (rr < 0) {
+        int errnum;
+        const char *errmsg = gzerror(compressed, &errnum);
+        fprintf(stderr, "ERROR: gzread failed during decompression: %s\n", errmsg);
+    }
+
+    fclose(decompressed);
+    gzclose(compressed);
+    unlink(compressed_path);
+
+    // Copy to /lib/firmware
+    const char *firmware_dst = "/lib/firmware/tcpborphserver.rbf";
+    FILE *src = fopen(decompressed_path, "rb");
+    FILE *dst = fopen(firmware_dst, "wb");
+    if (!src || !dst) {
+        perror("fopen for copy to /lib/firmware");
+        if (src) fclose(src);
+        if (dst) fclose(dst);
+        return 1;
+    }
+
+    while ((rr = fread(buf, 1, MTU, src)) > 0) {
+        if (fwrite(buf, 1, rr, dst) != (size_t)rr) {
+            perror("fwrite to /lib/firmware");
+            fclose(src);
+            fclose(dst);
+            return 1;
+        }
+    }
+
+    fclose(src);
+    fclose(dst);
+    unlink(decompressed_path);
+
+    struct stat rbfs;
+    if (stat(firmware_dst, &rbfs) == 0) {
+        fprintf(stderr, "DEBUG KCPFPG_INTEL: Final .rbf size: %ld bytes\n", rbfs.st_size);
+    } else {
+        perror("stat final .rbf");
+    }
+
+    // Trigger FPGA Manager
+    FILE *fw = fopen("/sys/class/fpga_manager/fpga0/firmware", "w");
+    if (!fw) {
+        perror("open firmware sysfs");
+        return 1;
+    }
+
+    if (fprintf(fw, "tcpborphserver.rbf") < 0) {
+        perror("write firmware name");
+        fclose(fw);
+        return 1;
+    }
+
+    fclose(fw);
+    fprintf(stderr, "DEBUG KCPFPG_INTEL: Successfully programmed FPGA\n");
+    return 0;
+}
 
 static int dispatch_client(struct ipr_state *ipr, char *name, unsigned int timeout)
 {
