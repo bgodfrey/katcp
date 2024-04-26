@@ -2,6 +2,9 @@
 #define __ARM_ARCH_8A
 #define FPGA_MANAGER_FW "/sys/class/fpga_manager/fpga0/firmware"
 #define FPGA_MANAGER_UPLOAD_FILE "/lib/firmware/blink_hps.rbf"
+#define LAST_CMD          "?quit"
+#define UPLOAD_CMD        "?uploadbin"
+#define BINFILE_FUDGE      4
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -44,6 +47,8 @@
 #define MAX_META_FIELDS   64
 #define BUFFER             8192
 
+extern int finalise_cmd(struct katcp_dispatch *d, int argc);
+
 typedef struct {
   char       name[64];
   char       addr_s[32];
@@ -57,68 +62,226 @@ typedef struct {
   char val[64];
 } meta_entry_t;
 
-struct ipr_state {
-  /* … existing fields … */
-  bool             saw_uploadbin;
-  size_t           n_registers;
-  register_entry_t registers[128];
-  size_t           n_metas;
-  meta_entry_t     metas[64];
+struct ipr_state{
+  int i_verbose;
+  int i_fd;
+  int i_ufd;
+
+  struct katcl_line *i_line;
+  struct katcl_line *i_input;
+  struct katcl_line *i_print;
+
+#if 0
+  struct stat sb;
+#endif
+
+  char *i_label;
+
+  char i_buffer[BUFFER];
+  unsigned int i_used;
+  unsigned int i_seen;
+
+  unsigned int i_timeout;
 };
 
-static void parse_fpg_header_katcp(struct katcp_dispatch *d, struct ipr_state *ipr, const char *path)
+struct ipr_state *create_ipr(struct katcp_dispatch *d, char *file, int verbose, char *label, unsigned int timeout)
 {
-  fprintf(stderr, "DEBUG HEADER PARSE: opening .fpg for header parse\n");
-  FILE  *f = fopen(path, "r");
-  if (!f) {
-    perror("ERROR: opening .fpg for header parse");
+  //i = malloc(sizeof(struct ipr_state));
+  struct ipr_state *i = calloc(1, sizeof(*i));
+  if(i == NULL){
+    return NULL;
+  }
+
+  i->i_verbose = verbose;	
+
+  //i->i_fd = -1;
+  //i->i_ufd = -1;
+
+  i->i_label = label;
+
+  /* i_buffer */
+  i->i_used = 0;
+  i->i_seen = 0;
+
+  i->i_timeout = timeout;
+
+  i->i_print = create_katcl(STDOUT_FILENO);
+  if(!i->i_print) {
+    fprintf(stderr, "ERROR: Couldn't set i_print\n");
+    free(i);
+    return NULL;
+  }
+  i->i_line = d->d_line;
+  fprintf(stderr, "\t\tDEBUG: Inside create_ipr set i_line\n");
+
+  if((file == NULL) || (!strcmp(file, "-"))){
+    i->i_fd = STDIN_FILENO;
+  } else {
+    i->i_fd = open(file, O_RDONLY);
+    if(i->i_fd < 0){
+      fprintf(stderr, "ERROR: Inside create_ipr could not open file\n");
+      log_message_katcl(i->i_print, KATCP_LEVEL_ERROR, i->i_label, "unable to open file %s: %s", file, strerror(errno));
+      destroy_katcl(i->i_print, 1);      
+      free(i);
+      return NULL;
+    }
+  }
+  i->i_input = create_katcl(i->i_fd);
+  fprintf(stderr, "\t\tDEBUG: Inside create_ipr set i_input\n");
+
+  if(!i->i_input){
+
+    log_message_katcl(i->i_print, KATCP_LEVEL_ERROR, i->i_label, "unable to allocate file parser");
+    close(i->i_fd);
+    destroy_katcl(i->i_print, 1);
+    free(i);
+    return NULL;
+  }
+  return i;
+}
+
+void destroy_ipr(struct ipr_state *i)
+{
+  if(i == NULL){
     return;
   }
-  char   line[1024];
 
-  while (fgets(line, sizeof(line), f)) {
-    // strip newline
-    line[strcspn(line, "\r\n")] = '\0';
-    fprintf(stderr, "DEBUG HEADER PARSE: Checking line %s\n", line);
+  if(i->i_print){
 
-    if (line[0] == '\0' || line[0] == '#') {
-      continue;
-    }
-    if (!strncmp(line, "?quit", 5)) {
-      fprintf(stderr, "\tDEBUG HEADER PARSE: Found !quit\n");
-      break;
-    }
-    // uploadbin marker
-    if (!strncmp(line, "?uploadbin", 10)) {
-      fprintf(stderr, "\tDEBUG HEADER PARSE: Found !uploadbin\n");
-      ipr->saw_uploadbin = true;
-      continue;
-    }
-    // parse register lines
-    if (!strncmp(line, "?register", 9) && ipr->n_registers < MAX_HDR_ENTRIES) {
-      fprintf(stderr, "\tDEBUG HEADER PARSE: Found ?register\n");
-      register_entry_t *e = &ipr->registers[ipr->n_registers];
-      if (sscanf(line, "?register %63s %31s %31s", e->name, e->addr_s, e->size_s) == 3) {
-        e->addr = strtoul(e->addr_s, NULL, 0);
-        e->size = strtoul(e->size_s, NULL, 0);
-        ipr->n_registers++;
+    sync_message_katcl(i->i_print, KATCP_LEVEL_DEBUG, i->i_label, "deallocating intepreter state variables");
+    destroy_katcl(i->i_print, 1);
+    i->i_print = NULL;
+  }
+
+  if(i->i_line){
+    destroy_rpc_katcl(i->i_line);
+    i->i_line = NULL;
+  }
+
+  if(i->i_input){
+    destroy_katcl(i->i_input, 0);
+    i->i_input = NULL;
+  }
+
+  if(i->i_fd > STDIN_FILENO){
+    close(i->i_fd);
+  }
+
+#if 0
+  if(i->i_mapped){
+    munmap(i->i_mapped, i->sb.st_size);
+    i->i_mapped = NULL;
+  }
+#endif
+
+  if(i->i_ufd > 0){
+    close(i->i_ufd);
+    i->i_ufd = -1;
+  }
+
+  i->i_label = NULL;
+
+  free(i);
+}
+
+int search_marker(struct ipr_state *ipr)
+{
+  int rr;
+  unsigned int i, j, test, limit, len;
+
+  len = strlen(LAST_CMD);
+  test = len + BINFILE_FUDGE;
+
+  for(;;){
+    rr = read(ipr->i_fd, ipr->i_buffer + ipr->i_used, BUFFER - ipr->i_used);
+    if(rr <= 0){
+      if(rr < 0){
+        switch(errno){
+          case EAGAIN :
+          case EINTR  :
+          break;
+          default :
+          log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "read of commands failed: %s", strerror(errno));
+          return -1;
+        }
+      } else {
+        log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "premature end of file before bitstream");
+        return 1;
       }
-      continue;
-  }
-  if (!strncmp(line, "?meta", 5) && ipr->n_metas < MAX_META_FIELDS) {
-    fprintf(stderr, "\tDEBUG HEADER PARSE: Found ?meta\n");
-    meta_entry_t *m = &ipr->metas[ipr->n_metas];
-    if (sscanf(line, "?meta %*s %*s %31s %63s", m->key, m->val) == 2) {
-      ipr->n_metas++;
+    } else {
+      ipr->i_used += rr;
     }
-    continue;
-}
+
+#ifdef DEBUG
+    fprintf(stderr, "now have %u, checking less %u\n", ipr->i_used, test);
+#endif
+
+
+    if(ipr->i_used > test){
+      limit = ipr->i_used - test;
+
+      for(i = 0; i < limit; i++){
+        if(ipr->i_buffer[i] == '?'){
+          if(!strncmp(ipr->i_buffer + i, LAST_CMD, len)){
+            if(i > 0){
+              for(unsigned int k = 0; k < i; k++){
+                 if (ipr->i_buffer[k] == '\t' || ipr->i_buffer[k] == '\r'){
+                  ipr->i_buffer[k] = ' ';
+                }
+              }
+              ipr->i_buffer[i] = '\0';
+              fprintf(stderr, "\tDEBUG: Converted tabs to spaces and null terminated\n");
+              if(load_katcl(ipr->i_input, ipr->i_buffer, i) < 0){
+                log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable to load last %u command bytes", i);
+                return -1;
+              }
+              ipr->i_seen += i;
+            }
+
+            sync_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "loaded %u bytes of commands", ipr->i_seen);
+
+            i += len;
+
+            for(j = 0; j < BINFILE_FUDGE; j++){
+              switch(ipr->i_buffer[i]){
+                case '\r' :
+                case '\n' :
+                  i++;
+                  break;
+                default :
+                  j = BINFILE_FUDGE; /* terminate for loop */
+                  break;
+              }
+            }
+
+            if(i > ipr->i_used){
+              log_message_katcl(ipr->i_print, KATCP_LEVEL_FATAL, ipr->i_label, "internal logic problem, ran over buffer");
+              return -1;
+            }
+
+            memmove(ipr->i_buffer, ipr->i_buffer + i, ipr->i_used - i);
+            ipr->i_used = ipr->i_used - i;
+
+            ipr->i_seen = 0;
+
+            return 0;
+          }
+        }
+      }
+
+      if(limit >= (BUFFER / 2)){
+        if(load_katcl(ipr->i_input, ipr->i_buffer, BUFFER / 2) < 0){
+          log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable a further %u command bytes", BUFFER / 2);
+          return -1;
+        }
+
+        memmove(ipr->i_buffer, ipr->i_buffer + (BUFFER / 2), ipr->i_used - (BUFFER / 2));
+        ipr->i_used = ipr->i_used - (BUFFER / 2);
+        ipr->i_seen += BUFFER / 2;
+      }
+    }
   }
-    fclose(f);
 }
-
-
-
 
 
 //int dispatch_one_parse_katcp(struct katcp_dispatch *d, struct katcl_parse *msg);
@@ -918,6 +1081,7 @@ int upload_bin_cmd(struct katcp_dispatch *d, int argc)
   return KATCP_RESULT_PAUSE;
 }
 
+
 /******************************************************************************************/
 
 int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n, void *data)
@@ -929,7 +1093,7 @@ int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n
   struct tbs_port_data *pd;
 
   pd = data;
-  fprintf(stderr, "DEBUG: upload_program_complete_tbs pd = %p\n", (void*)pd);
+  fprintf(stderr, "\tDEBUG: upload_program_complete_tbs pd = %p\n", (void*)pd);
   if(pd == NULL){
 #ifdef KATCP_CONSISTENCY_CHECKS
     fprintf(stderr, "logic problem: no port data given to handler\n");
@@ -944,115 +1108,95 @@ int upload_program_complete_tbs(struct katcp_dispatch *d, struct katcp_notice *n
       fprintf(stderr, "\tDEBUG: Got rid of port data (non‑Intel flow)\n");
   }    
 
+  
   if (is_intel_fpga()) {
     /* ── 1) ACK the program request and flush it immediately ── */
     fprintf(stderr, "\tDEBUG: Intel FPGA detected, sending !progremote ok\n");
     prepend_reply_katcp(g_client_dispatch);
-    append_string_katcp(g_client_dispatch, KATCP_FLAG_LAST|KATCP_FLAG_STRING, KATCP_OK);    
-    fprintf(stderr, "\tDEBUG: g_client_dispatch = %p before resume_katcp\n", (void*)g_client_dispatch);
-    resume_katcp(g_client_dispatch);  // <<< first flush
+    append_string_katcp(g_client_dispatch, KATCP_FLAG_LAST | KATCP_FLAG_STRING, KATCP_OK);
     fprintf(stderr, "\tDEBUG: Flushed !progremote ok\n");
-    template_shared_katcp(g_client_dispatch);
-
-      // argv for the “raw” mode
-    char *argv_raw[] = { "raw" };
-    if (setup_raw_tbs(g_client_dispatch,   // dispatch
-                      /*bofdir=*/NULL,     // not used for parse‐only
-                      /*argc=*/1,
-                      /*argv=*/argv_raw) < 0) {
-      fprintf(stderr, "ERROR: setup_raw_tbs failed\n");
-      pd->t_program = 0;
-      return -1;
-    }
-    /*Parse the .fpg header into that dispatch’s parser */
-    
-    struct ipr_state *ipr = calloc(1, sizeof(*ipr));
-    fprintf(stderr, "DEBUG: Allocated space for ipr_state\n");
-
-    if (!ipr) {
-      pd->t_program = 0;
-      return -1;
-    }
-    parse_fpg_header_katcp(g_client_dispatch,
-                          ipr,
-                          pd->t_name);
-    fprintf(stderr, "DEBUG: Parsed the fpg header\n");
-    free(ipr);
-    FILE *hdr = fopen(pd->t_name, "r");
-    fprintf(stderr, "DEBUG: Open file %s\n", pd->t_name);
-    if(hdr) {
-      char line[1024];
-      fprintf(stderr, "DEBUG: Created a character array\n");
-      while(fgets(line, sizeof(line), hdr)) {
-        fprintf(stderr, "DEBUG: Examining line %s\n", line);
-        size_t L = strcspn(line, "\r\n");
-        line[L] = 0;
-        if(line[0]=='\0' || line[0]=='#' || !strncmp(line, "?quit",5)) {
-          if(!strncmp(line, "?quit",5)){ 
-            fprintf(stderr, "\tDEBUG: Found ?quit in line\n");
-            break;
-          }  
-          continue;
-        }
-        if(!strncmp(line, "?uploadbin", 10)) {
-          continue;
-        }  
-        if(strncmp(line, "?register",9) && strncmp(line, "?meta",5))
-        {
-          fprintf(stderr, "\tDEBUG: Didn't find ?register or ?meta in line\n");
-          continue;
-        }
-          
-        /* tabs → spaces so katcl tokenizes properly */
-        for(char *p = line; *p; p++){ 
-          if(*p=='\t') { 
-            *p=' ';
-          }
-        }  
-
-        have_katcl(  g_client_dispatch->d_line );
-        load_katcl(  g_client_dispatch->d_line, line, L );
-        struct katcl_parse *msg = ready_katcl(g_client_dispatch->d_line);
-        append_parse_katcl(g_client_dispatch->d_line, msg);
-        dispatch_katcp(g_client_dispatch);
-      }
-      fclose(hdr);
-    }
-    else
-    {
-      fprintf(stderr, "DEBUG: Could not open header %s\n", pd->t_name);
-      pd->t_program = 0;
-      return -1;
-    }
-      
-    //if (map_raw_tbs(g_client_dispatch) < 0) {
-    //  fprintf(stderr, "ERROR: map_raw_tbs failed, header not parsed\n");
-    //}
-    /* mark the FPGA as programmed so ?listdev will work */
-    pd->t_program = 1;
-    fprintf(stderr, "\tDEBUG: Marked port_data as programmed (t_program=1)\n");
-    
-    
-    /* 3) Flip the FPGA state so ?listdev will see it’s programmed */
-    status_fpga_tbs(g_client_dispatch, TBS_FPGA_PROGRAMMED);
-    fprintf(stderr, "\tDEBUG: Set status to programmed\n");
-
-    finalise_cmd(g_client_dispatch, 0);
-    fprintf(stderr, "\tDEBUG: Finalizing katcp commands\n");
-
-    // 4) Tell the client we’re done
-    //resume_katcp(g_client_dispatch);
-    send_katcp(g_client_dispatch, KATCP_FLAG_FIRST|KATCP_FLAG_STRING, "#fpga", KATCP_FLAG_LAST |KATCP_FLAG_STRING,  "ready");
-    fprintf(stderr, "\tDEBUG: Sent completion flags\n");
     resume_katcp(g_client_dispatch);
-    resume_katcp(d);
-    fprintf(stderr,"DEBUG: Completed programming informs and fpga ready\n");
+    fprintf(stderr, "\tDEBUG: Resuming KATCP\n");
+
+    /* ── 2) Build an interpreter state exactly like fpg.c does ── */
+    struct ipr_state *ipr;
+    ipr = create_ipr(g_client_dispatch, pd->t_name, 0, "kcpfpg_intel", 1000);     
+
+    fprintf(stderr, "\tDEBUG: Created interpreter state\n");
+    if (!ipr) {
+      fprintf(stderr, "ERROR: Error in interpreter state\n");
+      log_message_katcl(g_client_dispatch, KATCP_LEVEL_ERROR, "kcpfpg_intel", "unable to allocate interpreter state");
+      return -1;
+    }
+    fprintf(stderr, "\tDEBUG: Created interpreter state\n");
+
+    /* ── 3) Scan up to the “?quit” marker, loading all ASCII requests ── */
+    if (search_marker(ipr) < 0) {
+      fprintf(stderr, "ERROR: Could not find ?quit marker\n");
+      log_message_katcl(g_client_dispatch, KATCP_LEVEL_ERROR, ipr->i_label, "unable to scan fpg header");
+      destroy_ipr(ipr);
+      return -1;
+    }
+    fprintf(stderr, "\tDEBUG: Scanned header and loaded commands\n");
+
+    /* ── 4) Register the shared KATCP handlers so our callbacks for
+          ?register and ?meta are in place ── */
+    template_shared_katcp(g_client_dispatch);
+    fprintf(stderr, "\tDEBUG: Registered KATCP handlers\n");
+
+    /* ── 5) Drain every loaded request, skipping ?uploadbin ── */
+    while (have_katcl(ipr->i_input) > 0) {
+      char *request = arg_string_katcl(ipr->i_input, 0);
+      if (!request) {
+        fprintf(stderr, "\tDEBUG: Bad request\n");
+        break;
+      }
+      fprintf(stderr, "\tDEBUG: Header request = %s\n", request);
+
+      /* a) skip the upload marker */
+      if (strcmp(request, UPLOAD_CMD) == 0) {
+        (void)ready_katcl(ipr->i_input);
+        fprintf(stderr, "\tDEBUG: Skipped %s\n", UPLOAD_CMD);
+        continue;
+      }
+
+      /* b) only replay true requests (not informs) */
+      if (request[0] == KATCP_REQUEST) {
+        struct katcl_parse *px = ready_katcl(ipr->i_input);
+        append_parse_katcl(g_client_dispatch->d_line, px);
+        dispatch_katcp(g_client_dispatch);
+        fprintf(stderr, "\tDEBUG: Dispatched %s into client dispatch\n", request);
+      } else {
+        /* consume anything else */
+        fprintf(stderr, "\tDEBUG: Not a valid KATCP request\n");
+        (void)ready_katcl(ipr->i_input);
+      }
+    }
+
+    /* ── 6) Tear down interpreter state ── */
+    destroy_ipr(ipr);
+    fprintf(stderr, "\tDEBUG: Tearing down interpreter state\n");
+    fprintf(stderr, "\tDEBUG: Closed file\n");
+
+    /* ── 7) Mark FPGA as programmed so ?listdev will succeed ── */
+    pd->t_program = 1;
+    fprintf(stderr, "\tDEBUG: Marked port_data as programmed\n");
+
+    /* ── 8) Advance the raw mode state to PROGRAMMED→MAPPED→READY ── */
+    status_fpga_tbs(g_client_dispatch, TBS_FPGA_PROGRAMMED);
+    finalise_cmd(g_client_dispatch, 0);
+    fprintf(stderr, "\tDEBUG: Raw mode finalised to READY\n");
+
+    /* ── 9) Flush out any queued register/meta informs ── */
+    resume_katcp(g_client_dispatch);
+    fprintf(stderr, "\tDEBUG: Flushed queued informs\n");
+
+    /* ── 10) Send the “#fpga ready” inform ── */
+    send_katcp(g_client_dispatch,KATCP_FLAG_FIRST | KATCP_FLAG_STRING,   "#fpga", KATCP_FLAG_LAST  | KATCP_FLAG_STRING,   "ready");
+    resume_katcp(g_client_dispatch);
+    fprintf(stderr, "\tDEBUG: Sent #fpga ready inform\n");
   }
-  else {
-    fprintf(stderr, "DEBUG: Not the Intel path\n");
-    destroy_port_data_tbs(d, pd, 0);
-    //destroy_port_data_tbs(g_client_dispatch, pd, 0);
-  }
+
   //return KATCP_RESULT_OK;
   return 0;
 }
