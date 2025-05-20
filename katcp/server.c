@@ -577,6 +577,7 @@ int prepare_core_loop_katcp(struct katcp_dispatch *dl)
 /* This is the main loop that combines both old and new style logic - it is called via two main (but many sub) initialisation paths */
 int run_core_loop_katcp(struct katcp_dispatch *dl)
 {
+    fprintf(stderr, "DEBUG: Inside run_core_loop_katcp\n");
 #define LABEL_BUFFER 32
   /* int nfd; */
   int run, result, suspend, rapid;
@@ -849,6 +850,7 @@ int run_pipe_server_katcp(struct katcp_dispatch *dl, char *file, int pfd)
 
 int run_config_server_katcp(struct katcp_dispatch *dl, char *file, int count, char *host, int port)
 {
+  fprintf(stderr, "DEBUG: Inside run_config_server_katcp\n");
   int fd, result;
 
   if(count <= 0){

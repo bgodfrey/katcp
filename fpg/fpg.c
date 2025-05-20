@@ -47,8 +47,6 @@
 #define BINFILE_HEAD       132     /* require at least this much */
 
 #define CONNECT_ATTEMPTS   6
-int program_intel_rbf(char *fpg_file);
-int is_intel_fpga(void);
 
 struct ipr_state{
   int i_verbose;
@@ -71,193 +69,6 @@ struct ipr_state{
 
   unsigned int i_timeout;
 };
-
-// Check for an Intel device
-int is_intel_fpga()
-{
-    struct stat st;
-
-    // First check sysfs
-    if (stat("/sys/class/fpga_manager/fpga0", &st) == 0) {
-        return 1;
-    }
-
-    // Fall back to device tree check
-    FILE *f = fopen("/proc/device-tree/compatible", "rb");
-    if (f) {
-        char buffer[256];
-        fread(buffer, 1, sizeof(buffer)-1, f);
-        fclose(f);
-        buffer[sizeof(buffer)-1] = '\0';
-        if (strstr(buffer, "altr,socfpga"))
-            return 1;
-    }
-
-    return 0; // Otherwise assume not Intel
-}
-
-// Check for a gzip file by looking at the first two characters
-int is_gzipped_file(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return 0; // Assume not gzipped if can't open
-    }
-
-    unsigned char magic[2];
-    if (fread(magic, 1, 2, f) != 2) {
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
-
-    return (magic[0] == 0x1f && magic[1] == 0x8b);
-}
-
-int program_intel_rbf(char* fpg_file) {
-
-    const char *input_fpg = fpg_file;
-    struct stat st;
-
-    if (stat(input_fpg, &st) != 0) {
-        perror("stat on input .fpg failed");
-        return 1;
-    }
-
-    fprintf(stderr, "DEBUG KCPFPG_INTEL: launching on: %s\n", input_fpg);
-    fprintf(stderr, "DEBUG KCPFPG_INTEL: Input .fpg size: %ld bytes\n", st.st_size);
-
-    char buf[MTU];
-    char *base = basename((char *)input_fpg);
-    char compressed_path[PATH_MAX];
-    snprintf(compressed_path, sizeof(compressed_path), "/tmp/%s_payload.gz", base);
-
-    FILE *in = fopen(input_fpg, "rb");
-    if (!in) {
-        perror("fopen input .fpg");
-        return 1;
-    }
-
-    FILE *compressed_out = fopen(compressed_path, "wb");
-    if (!compressed_out) {
-        perror("fopen compressed output");
-        fclose(in);
-        return 1;
-    }
-
-    // Skip ASCII header until we find ?quit
-    char line[MTU];
-    long payload_offset = -1;
-    while (fgets(line, sizeof(line), in)) {
-        if (strncmp(line, "?quit", 5) == 0) {
-            payload_offset = ftell(in); // offset after newline following ?quit
-            break;
-        }
-    }
-
-    if (payload_offset < 0) {
-        fprintf(stderr, "ERROR: ?quit not found in .fpg file\n");
-        fclose(in);
-        fclose(compressed_out);
-        return 1;
-    }
-
-    fprintf(stderr, "DEBUG KCPFPG_INTEL: Found ?quit at offset %ld\n", payload_offset);
-
-    // Copy raw gzipped payload
-    fseek(in, payload_offset, SEEK_SET);
-    size_t r;
-    while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
-        fwrite(buf, 1, r, compressed_out);
-    }
-
-    fclose(in);
-    fclose(compressed_out);
-
-    // Now decompress the extracted gzip stream
-    gzFile compressed = gzopen(compressed_path, "rb");
-    if (!compressed) {
-        perror("gzopen decompress");
-        return 1;
-    }
-
-    char decompressed_path[PATH_MAX];
-    snprintf(decompressed_path, sizeof(decompressed_path), "/tmp/%s_decompressed.rbf", base);
-    FILE *decompressed = fopen(decompressed_path, "wb");
-    if (!decompressed) {
-        perror("fopen decompressed output");
-        gzclose(compressed);
-        return 1;
-    }
-
-    int rr;
-    while ((rr = gzread(compressed, buf, MTU)) > 0) {
-        if (fwrite(buf, 1, rr, decompressed) != (size_t)rr) {
-            perror("fwrite decompressed");
-            fclose(decompressed);
-            gzclose(compressed);
-            return 1;
-        }
-    }
-
-    if (rr < 0) {
-        int errnum;
-        const char *errmsg = gzerror(compressed, &errnum);
-        fprintf(stderr, "ERROR: gzread failed during decompression: %s\n", errmsg);
-    }
-
-    fclose(decompressed);
-    gzclose(compressed);
-    unlink(compressed_path);
-
-    // Copy to /lib/firmware
-    const char *firmware_dst = "/lib/firmware/tcpborphserver.rbf";
-    FILE *src = fopen(decompressed_path, "rb");
-    FILE *dst = fopen(firmware_dst, "wb");
-    if (!src || !dst) {
-        perror("fopen for copy to /lib/firmware");
-        if (src) fclose(src);
-        if (dst) fclose(dst);
-        return 1;
-    }
-
-    while ((rr = fread(buf, 1, MTU, src)) > 0) {
-        if (fwrite(buf, 1, rr, dst) != (size_t)rr) {
-            perror("fwrite to /lib/firmware");
-            fclose(src);
-            fclose(dst);
-            return 1;
-        }
-    }
-
-    fclose(src);
-    fclose(dst);
-    unlink(decompressed_path);
-
-    struct stat rbfs;
-    if (stat(firmware_dst, &rbfs) == 0) {
-        fprintf(stderr, "DEBUG KCPFPG_INTEL: Final .rbf size: %ld bytes\n", rbfs.st_size);
-    } else {
-        perror("stat final .rbf");
-    }
-
-    // Trigger FPGA Manager
-    FILE *fw = fopen("/sys/class/fpga_manager/fpga0/firmware", "w");
-    if (!fw) {
-        perror("open firmware sysfs");
-        return 1;
-    }
-
-    if (fprintf(fw, "tcpborphserver.rbf") < 0) {
-        perror("write firmware name");
-        fclose(fw);
-        return 1;
-    }
-
-    fclose(fw);
-    fprintf(stderr, "DEBUG KCPFPG_INTEL: Successfully programmed FPGA\n");
-    return 0;
-}
 
 static int dispatch_client(struct ipr_state *ipr, char *name, unsigned int timeout)
 {
@@ -309,7 +120,8 @@ static int dispatch_client(struct ipr_state *ipr, char *name, unsigned int timeo
     if(FD_ISSET(fd, &fsw)){
       result = write_katcl(ipr->i_line);
       if(result < 0){
-        fprintf(stderr, "dispatch: write failed: %s\n", strerror(error_katcl(ipr->i_line)));
+        fprintf(stderr, "DEBUG_FPG: dispatch: write failed: %s\n", strerror(error_katcl(ipr->i_line)));
+        fflush(stderr);
         return -1;
       }
       if((result > 0) && (name == NULL)){ /* if we finished writing and don't expect a match then quit */
@@ -420,7 +232,8 @@ struct ipr_state *create_ipr(char *server, char *file, int verbose, char *label,
 
   i->i_print = create_katcl(STDOUT_FILENO);
   if(i->i_print == NULL){
-    fprintf(stderr, "unable to allocate state\n");
+    fprintf(stderr, "DEBUG_FPG: Unable to allocate state\n");
+    fflush(stderr);
     destroy_ipr(i);
     return NULL;
   }
@@ -428,6 +241,7 @@ struct ipr_state *create_ipr(char *server, char *file, int verbose, char *label,
   log_message_katcl(i->i_print, KATCP_LEVEL_DEBUG, i->i_label, "initialising intepreter state variables");
 
   i->i_line = create_name_rpc_katcl(server);
+  //i->i_line = create_katcl(STDIN_FILENO);
   if(i->i_line == NULL){
     sync_message_katcl(i->i_print, KATCP_LEVEL_ERROR, i->i_label, "unable to create client connection to server %s: %s", server, strerror(errno));
     destroy_ipr(i);
@@ -436,8 +250,11 @@ struct ipr_state *create_ipr(char *server, char *file, int verbose, char *label,
 
   if((file == NULL) || (!strcmp(file, "-"))){
     i->i_fd = STDIN_FILENO;
+    fprintf(stderr, "DEBUG_FPG: Setting file as STDIN_FILENO\n");
+
   } else {
     i->i_fd = open(file, O_RDONLY);
+    fprintf(stderr, "DEBUG_FPG: Opening file as read only\n");
     if(i->i_fd < 0){
       log_message_katcl(i->i_print, KATCP_LEVEL_ERROR, i->i_label, "unable to open file %s: %s", file, strerror(errno));
       destroy_ipr(i);
@@ -476,7 +293,8 @@ int search_marker(struct ipr_state *ipr)
 {
   int rr;
   unsigned int i, j, test, limit, len;
-
+  fprintf(stderr, "DEBUG_FPG: Called search_marker\n");
+  fflush(stderr);
   len = strlen(LAST_CMD);
   test = len + BINFILE_FUDGE;
 
@@ -519,8 +337,11 @@ int search_marker(struct ipr_state *ipr)
               ipr->i_seen += i;
             }
 
-            sync_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "loaded %u bytes of commands", ipr->i_seen);
-
+            // ipr->i_seen + i includes only commands parsed before ?quit
+            //sync_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "loaded %u bytes of commands", ipr->i_seen + i);
+            sync_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "loaded %u bytes of commands", i);
+            fprintf(stderr, "DEBUG_FPG: Loaded %u bytes of commands\n", i);
+            fflush(stderr);
             i += len;
 
             for(j = 0; j < BINFILE_FUDGE; j++){
@@ -534,7 +355,13 @@ int search_marker(struct ipr_state *ipr)
                   break;
               }
             }
-
+            if (ipr->i_buffer[i] == 0x1f && ipr->i_buffer[i+1] == 0x8b) {
+              fprintf(stderr, "DEBUG_FPG: Found gzip header at offset %d\n", i);
+            }
+            else{
+              fprintf(stderr, "DEBUG_FPG: Did not find correct starting bits for gzip\n");
+            }
+            //ipr->i_seen += i;
             if(i > ipr->i_used){
               log_message_katcl(ipr->i_print, KATCP_LEVEL_FATAL, ipr->i_label, "internal logic problem, ran over buffer");
               return -1;
@@ -542,9 +369,25 @@ int search_marker(struct ipr_state *ipr)
 
             memmove(ipr->i_buffer, ipr->i_buffer + i, ipr->i_used - i);
             ipr->i_used = ipr->i_used - i;
-
+            fprintf(stderr, "DEBUG_FPG: Seeking to ipr->i_seen = %d\n", ipr->i_seen);
+            /*
+            if (lseek(ipr->i_fd, ipr->i_seen, SEEK_SET) == -1) {
+} 
+            if(lseek(ipr->i_fd, ipr->i_seen, SEEK_SET) == -1){
+              perror("lseek failed");
+            }
+            else{  
+              off_t new_pos = lseek(ipr->i_fd, 0, SEEK_CUR);
+            
+              if (new_pos == -1) {
+                fprintf(stderr, "DEBUG_FPG: lseek failed returned -1");
+              } else {
+                fprintf(stderr, "DEBUG_FPG: New file offset is %lld\n", new_pos);
+              }
+            }
+            */  
             ipr->i_seen = 0;
-
+            fprintf(stderr, "DEBUG_FPG: ipr->i_fd inside search_marker() = %d\n", ipr->i_fd);
             return 0;
           }
         }
@@ -569,7 +412,8 @@ int check_bitstream(struct ipr_state *ipr)
 {
   int rr;
   uint32_t id;
-
+  fprintf(stderr, "DEBUG_FPG: Called check_bitstream\n");
+  fflush(stderr);
   while(ipr->i_used < BUFFER){
     rr = read(ipr->i_fd, ipr->i_buffer + ipr->i_used, BUFFER - ipr->i_used);
     if(rr <= 0){
@@ -616,7 +460,8 @@ int prepare_upload(struct ipr_state *ipr)
 #if 0
   char *status;
 #endif
-
+  fprintf(stderr, "DEBUG_FPG: Called prepare_upload\n");
+  fflush(stderr);
   /* populate a request */
   if(append_string_katcl(ipr->i_line, KATCP_FLAG_FIRST | KATCP_FLAG_LAST, "?uploadbin")   < 0) {
     log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable to populate upload request");
@@ -646,7 +491,8 @@ int prepare_upload(struct ipr_state *ipr)
 int waitfor_fpga(struct ipr_state *ipr)
 {
   char *status;
-
+  fprintf(stderr, "DEBUG_FPG: Called waitfor_fpga\n");
+  fflush(stderr);
   /* use above function to send upload request */
   if(dispatch_client(ipr, "!uploadbin", ipr->i_timeout * LONG_TIMEOUT_FACTOR) < 0) {
     log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "did not see uploadbin reply");
@@ -677,11 +523,18 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
 {
   int attempts, run;
   int rr, wr;
+  fprintf(stderr, "DEBUG_FPG: Called program_bin\n");
+  fflush(stderr);
+  off_t pos = lseek(ipr->i_fd, 0, SEEK_CUR);
+  fprintf(stderr, "DEBUG_FPG: Offset at start of program_bin = %lld\n", (long long)pos);
+  fprintf(stderr, "DEBUG_FPG: Writing to server %s port %d\n", server, port);
 
   for(attempts = 0; attempts < CONNECT_ATTEMPTS; attempts++){
     ipr->i_ufd = net_connect(server, port, ipr->i_verbose ? (NETC_VERBOSE_ERRORS | NETC_VERBOSE_STATS) : 0);
     if(ipr->i_ufd < 0){
       log_message_katcl(ipr->i_print, KATCP_LEVEL_INFO, ipr->i_label, "retrying connect to port %d", port);
+      fprintf(stderr, "DEBUG_FPG: Retrying connect to port %d\n", port);
+
       usleep(40000*(attempts+1)*(attempts+2));
     } else {
       attempts = CONNECT_ATTEMPTS;
@@ -689,6 +542,7 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
   }
 
   if(ipr->i_ufd < 0){
+    fprintf(stderr, "DEBUG_FPG: Unable to connect to port %d: %s\n", port, strerror(errno));
     log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable to connect to port %d: %s", port, strerror(errno));
     return -1;
   }
@@ -705,6 +559,7 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
               break;
             default :
               log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "read of bitstream failed: %s", strerror(errno));
+              fprintf(stderr, "DEBUG_FPG: Read of bistream failed: %s\n", strerror(errno));
               return -1;
           }
         } else {
@@ -723,6 +578,7 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
           case EINTR  :
             break;
           default :
+            fprintf(stderr, "DEBUG_FPG: Upload of bistream failed after %u bytes: %s\n", ipr->i_seen, strerror(errno));
             log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "upload of bitstream failed after %u bytes: %s", ipr->i_seen, strerror(errno));
             return -1;
         }
@@ -741,13 +597,17 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
       }
     }
   }
-
+  shutdown(ipr->i_ufd, SHUT_WR);
+  fprintf(stderr, "DEBUG_FPG: Shutting things down\n");
   close(ipr->i_ufd);
+  fprintf(stderr, "DEBUG_FPG: Closing things\n");
   ipr->i_ufd = (-1);
-
+  
+  fprintf(stderr, "DEBUG_FPG: Send %u bytes of bitstream\n", ipr->i_seen);
   log_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "send %u bytes of bitstream", ipr->i_seen);
 
   if(waitfor_fpga(ipr) < 0) {
+    fprintf(stderr, "DEBUG_FPG: Await reply failed\n");
     log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "await reply failed", __func__);
     return -1;
   }
@@ -758,7 +618,8 @@ int program_bin(struct ipr_state *ipr, char *server, int port)
 int finalise_upload(struct ipr_state *ipr)
 {
   char *status;
-
+  fprintf(stderr, "DEBUG_FPG: Called finalise_upload\n");
+  fflush(stderr);
   /* populate a request */
   if(append_string_katcl(ipr->i_line, KATCP_FLAG_FIRST | KATCP_FLAG_LAST, "?finalise") < 0) {
     log_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable to populate finalise request");
@@ -808,7 +669,8 @@ int main(int argc, char **argv)
   int port = 7146;
 
   struct ipr_state *ipr;
-
+  fprintf(stderr, "DEBUG_FPG: Inside kcpfpg\n");
+  fflush(stderr);
 
   if(isatty(STDOUT_FILENO)){
     verbose = 1;
@@ -864,7 +726,8 @@ int main(int argc, char **argv)
             i++;
           }
           if (i >= argc) {
-            fprintf(stderr, "%s: argument needs a parameter\n", argv[0]);
+            fprintf(stderr, "DEBUG_FPG: %s: argument needs a parameter\n", argv[0]);
+            fflush(stderr);
             return 2;
           }
 
@@ -893,7 +756,8 @@ int main(int argc, char **argv)
           break;
 
         default:
-          fprintf(stderr, "%s: unknown option -%c\n", argv[0], argv[i][j]);
+          fprintf(stderr, "DEBUG_FPG: %s: unknown option -%c\n", argv[0], argv[i][j]);
+          fflush(stderr);
           return 2;
       }
     } else {
@@ -911,15 +775,24 @@ int main(int argc, char **argv)
   /* Initialise the intepreter state */
   ipr = create_ipr(server, file, verbose, label, timeout); 
   if(ipr == NULL){
-    fprintf(stderr, "%s: unable to allocate intepreter state\n", argv[0]);
+    fprintf(stderr, "DEBUG_FPG: %s: unable to allocate intepreter state\n", argv[0]);
+    fflush(stderr);
     return 2;
   }
 
+  fprintf(stderr, "DEBUG_FPG: ipr->i_fd before search_marker = %d\n", ipr->i_fd);
   if(search_marker(ipr) < 0){
+    fprintf(stderr, "DEBUG_FPG: Unable to scan fpg file\n");
+    fflush(stderr);
     sync_message_katcl(ipr->i_print, KATCP_LEVEL_ERROR, ipr->i_label, "unable to scan fpg file", LAST_CMD);
     destroy_ipr(ipr);
     return 2;
   }
+  fprintf(stderr, "DEBUG_FPG: ipr->i_fd after search_marker() = %d\n", ipr->i_fd);
+  fflush(stderr);
+  off_t pos = lseek(ipr->i_fd, 0, SEEK_CUR);
+  fprintf(stderr, "DEBUG_FPG: Stream offset after header: %lld bytes\n", pos);
+  fflush(stderr);
 
   if(ipr->i_verbose){
     sync_message_katcl(ipr->i_print, KATCP_LEVEL_TRACE, ipr->i_label, "using %ums and %ums for short and long timeouts respectively", ipr->i_timeout, ipr->i_timeout * LONG_TIMEOUT_FACTOR);
@@ -1012,7 +885,11 @@ int main(int argc, char **argv)
     }
     sync_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "finalise command sent successfully");
   }
-
+  
+  fprintf(stderr, "DEBUG_FPG: about to send !progremote ok\n");
+  send_katcl(ipr->i_line, "!progremote", KATCP_OK, "programming successful");
+  fprintf(stderr, "DEBUG_FPG: Sent !progremote ok\n");
+  fflush(stderr);
   destroy_ipr(ipr);
 
   return 0;

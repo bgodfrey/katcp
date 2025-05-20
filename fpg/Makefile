@@ -5,7 +5,7 @@ include ../Makefile.inc
 CFLAGS := $(filter-out -DDEBUG,$(CFLAGS))
 
 INC = -I$(KATCP)
-LIB = -L$(KATCP) -lkatcp
+LIB = -L$(KATCP) -lkatcp  -lz
 
 EXE = kcpfpg
 SRC = fpg.c
@@ -24,5 +24,5 @@ clean:
 	$(RM) $(OBJ) core $(EXE)
 
 install: all
-	$(INSTALL) -d $(PREFIX)
+	$(INSTALL)  -d $(PREFIX)
 	$(INSTALL) $(EXE) $(PREFIX)/bin

@@ -2724,6 +2724,8 @@ int map_raw_tbs(struct katcp_dispatch *d)
     return -1;
   }
 
+  tr->r_map_offset = 0xC0000000;
+  tr->r_map_size = 0x1000;
   tr->r_map = mmap(NULL, tr->r_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tr->r_map_offset);
 
   if(tr->r_map == MAP_FAILED){
@@ -3033,6 +3035,7 @@ int make_bofdir_tbs(struct katcp_dispatch *d, struct tbs_raw *tr, char *bofdir)
 
 int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv)
 {
+  fprintf(stderr, "DEBUG_RAW: Inside setup_raw_tbs\n");
   struct tbs_raw *tr;
   int result;
 #if 0
@@ -3122,7 +3125,7 @@ int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv)
   bus_error_happened = 0;
 
   result = 0;
-
+  fprintf(stderr, "DEBUG_RAW: Registering tcpborphserver commands\n");
   result += register_flag_mode_katcp(d, "?finalise",     "mark register definitions as complete (?finalise)", &finalise_cmd, 0, TBS_MODE_RAW);
 
   result += register_flag_mode_katcp(d, "?phyprog",      "programs firmware onto phy chip on mezzanine card (?phyprog mezzanine_card phy_number [file <filename>] [force])", &phy_prog_cmd, 0, TBS_MODE_RAW);

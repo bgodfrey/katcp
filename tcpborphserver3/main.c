@@ -43,6 +43,7 @@ void usage(char *app)
 
 int main(int argc, char **argv)
 {
+  fprintf(stderr, "DEBUG_MAIN: Inside main function\n");
   struct katcp_dispatch *d;
   int status;
   int i, j, c, foreground, lfd;
@@ -76,6 +77,7 @@ int main(int argc, char **argv)
         case 'f' :
           j++;
           foreground = 1 - foreground;
+          fprintf(stderr, "DEBUG_MAIN: Running tcpborphserver in foreground\n");
           break;
 
         case 'b' :
@@ -131,12 +133,13 @@ int main(int argc, char **argv)
   }
 
   /* create a state handle */
+  fprintf(stderr, "DEBUG_MAIN: Creating a state handle\n");
   d = startup_katcp();
   if(d == NULL){
     fprintf(stderr, "%s: unable to allocate state\n", argv[0]);
     return 1;
   }
-
+  fprintf(stderr, "DEBUG_MAIN: Setting up raw tcpborphserver\n");
   if(setup_raw_tbs(d, bofdir, argc, argv) < 0){
     fprintf(stderr, "%s: unable to initialise logic for raw mode\n", argv[0]);
     return 1;
@@ -144,6 +147,7 @@ int main(int argc, char **argv)
 
   /* mode from command line */
   if(mode){
+    fprintf(stderr, "DEBUG_MAIN: Entering name mode katcp\n");
     if(enter_name_mode_katcp(d, mode, NULL) < 0){
       fprintf(stderr, "%s: unable to enter mode %s\n", argv[0], mode);
       return 1;
@@ -171,14 +175,14 @@ int main(int argc, char **argv)
 #ifdef DEBUG
   fprintf(stderr, "server: about to run config server\n");
 #endif
-
+  fprintf(stderr, "DEBUG_MAIN: Configuring katcp server\n");
   if(run_config_server_katcp(d, init, TBS_MAX_CLIENTS, port, 0) < 0){
     fprintf(stderr, "server: run failed\n");
     return 1;
   }
 
   status = exited_katcp(d);
-
+  fprintf(stderr, "DEBUG_MAIN: Shutting down katcp\n");
   shutdown_katcp(d);
 
 #ifdef DEBUG

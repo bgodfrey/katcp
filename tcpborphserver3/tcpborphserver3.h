@@ -10,6 +10,7 @@
 
 #define TBS_MODE_RAW        0 
 #define TBS_MODE_RAW_NAME  "raw"
+#define USE_FPGA_MANAGER 1
 
 #ifdef DEBUG
 #define TBS_LOGFILE        "tcpborphserver3.log"
@@ -17,28 +18,37 @@
 #define TBS_LOGFILE        "/var/log/tcpborphserver3.log"
 #endif
 
-#ifdef __PPC__ /* check for PPC roach */
+
+//#ifdef __PPC__ /* check for PPC roach */
+//#define TBS_DO_FLIP        0
+//#define TBS_FPGA_CONFIG    "/dev/roach/config"
+//#define TBS_FPGA_MEM       "/dev/roach/mem"
+//#elif defined(__ARM_ARCH_7A__) /* check for arm 7 (red pitaya board zync soc)  */
+//#define TBS_DO_FLIP        1
+//#define TBS_FPGA_CONFIG    "/dev/xdevcfg"
+//#define TBS_FPGA_MEM       "/dev/mem"
+//#elif defined(__ARM_ARCH_8A__) || defined(USE_FPGA_MANAGER)  /* check for arm 8 (zynq ultrascal mpsoc)*/
+//#define TBS_DO_FLIP        0
+//#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
+//#define TBS_FPGA_MEM       "/dev/mem"
+//#define FPGA_MANAGER_FLAG  "/sys/class/fpga_manager/fpga0/flags"
+//#define FPGA_MANAGER_FW    "/sys/class/fpga_manager/fpga0/firmware"
+//#else
+//#define TBS_DO_FLIP        0
+//#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
+//#define TBS_FPGA_MEM       "/dev/mem"
+//#endif
+
+
 #define TBS_DO_FLIP        0
-#define TBS_FPGA_CONFIG    "/dev/roach/config"
-#define TBS_FPGA_MEM       "/dev/roach/mem"
-#elif __ARM_ARCH_7A__ /* check for arm 7 (red pitaya board zync soc)  */
-#define TBS_DO_FLIP        1
-#define TBS_FPGA_CONFIG    "/dev/xdevcfg"
-#define TBS_FPGA_MEM       "/dev/mem"
-#elif __ARM_ARCH_8A /* check for arm 8 (zynq ultrascal mpsoc)*/
-#define TBS_DO_FLIP        0
-#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
+#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.rbf"
 #define TBS_FPGA_MEM       "/dev/mem"
 #define FPGA_MANAGER_FLAG  "/sys/class/fpga_manager/fpga0/flags"
 #define FPGA_MANAGER_FW    "/sys/class/fpga_manager/fpga0/firmware"
-#else
-#define TBS_DO_FLIP        0
-#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
-#define TBS_FPGA_MEM       "/dev/mem"
-#endif
-
 #define TBS_KCPFPG_PATH    "/bin/kcpfpg"
 #define TBS_RAMFILE_PATH   "/dev/shm/gateware"
+#define TBS_RAMFILE_PATH_XILINX "/dev/shm/gateware"
+#define TBS_RAMFILE_PATH_INTEL  "/lib/firmware/tcpborphserver.rbf"
 
 #define TBS_FPGA_STATUS    "#fpga"
 #define TBS_KCPFPG_EXE     "kcpfpg"
