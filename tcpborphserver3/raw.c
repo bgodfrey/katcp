@@ -2724,8 +2724,8 @@ int map_raw_tbs(struct katcp_dispatch *d)
     return -1;
   }
 
-  tr->r_map_offset = 0xC0000000;
-  tr->r_map_size = 0x1000;
+  tr->r_map_offset = 0xFF200000;
+  tr->r_map_size = 0x10000;
   tr->r_map = mmap(NULL, tr->r_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tr->r_map_offset);
 
   if(tr->r_map == MAP_FAILED){

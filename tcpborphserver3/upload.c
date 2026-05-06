@@ -385,6 +385,7 @@ int subprocess_upload_tbs(struct katcl_line *l, void *data)
 
   count = 0;
   off_t total_written = 0;
+  fprintf(stderr, "DEBUG: t_type is %d, pd->t_name is %s\n", pd->t_type, pd->t_name);
   for (;;){
     rr = gzread(gfd, buf, MTU);
     if (rr == 0){

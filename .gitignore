@@ -11,3 +11,13 @@
 # ignore ctags
 tags
 core
+
+# ignore strace and error logs
+/tbs.strace
+/tbs.strace.*
+/tcpborphserver3/tbs.strace
+/tcpborphserver3/tbs.strace.*
+/tcpborphserver3/errors.log
+
+# ignore vscode stuff
+tcpborphserver3/.vscode/*
