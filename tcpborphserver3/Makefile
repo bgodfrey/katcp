@@ -16,7 +16,7 @@ CFLAGS += -ggdb
 #CFLAGS += -DINTERNAL_HWMON
 
 SERVER = tcpborphserver3
-SRC = main.c raw.c loadbof.c tg.c tapper.c hwmon.c upload.c subprocess.c ev.c phy.c
+SRC = main.c raw.c loadbof.c tg.c tapper.c hwmon.c upload.c subprocess.c ev.c phy.c platform.c
 
 OBJ = $(patsubst %.c,%.o,$(SRC))
 all: $(SERVER)
@@ -36,4 +36,3 @@ install: all
 
 test-bof: bof.c 
 	$(CC) $(CFLAGS) -DSTANDALONE -o $@ $^ -I../katcp
-

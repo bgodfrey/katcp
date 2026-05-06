@@ -863,11 +863,8 @@ int word_write_cmd(struct katcp_dispatch *d, int argc)
   struct tbs_entry *te;
 
   unsigned int i, start, shift, j;
-  uint32_t value, prev, update, current;
+  uint32_t value, prev, update, current, flip;
   char *name;
-#if TBS_DO_FLIP
-  uint32_t flip;
-#endif
 
   tr = get_mode_katcp(d, TBS_MODE_RAW);
   if(tr == NULL){
@@ -927,14 +924,13 @@ int word_write_cmd(struct katcp_dispatch *d, int argc)
 
     value = arg_unsigned_long_katcp(d, i);
 
-#if TBS_DO_FLIP
-    /* this hack is on the request of Wes to do endianess hacking in tcpborphserver for the redpitaya */
-    /* it will mangle registers not on the word boundary, and words not 32bits in size. Be warned */
-    flip = flip32(value);
-    update = prev | (flip >> shift);
-#else
-    update = prev | (value >> shift);
-#endif
+    if(platform_do_flip_tbs()){
+      /* This legacy Red Pitaya path mangles non-word-aligned registers. */
+      flip = flip32(value);
+      update = prev | (flip >> shift);
+    } else {
+      update = prev | (value >> shift);
+    }
 
     log_message_katcp(d, KATCP_LEVEL_TRACE, NULL, "writing 0x%x to position 0x%x", update, j);
 
@@ -1276,11 +1272,8 @@ int word_read_cmd(struct katcp_dispatch *d, int argc)
   struct tbs_raw *tr;
   struct tbs_entry *te;
   char *name;
-  uint32_t value, prev, current;
+  uint32_t value, prev, current, flip;
   unsigned int length, start, i, j, shift, flags;
-#if TBS_DO_FLIP
-  uint32_t flip;
-#endif
 
   tr = get_mode_katcp(d, TBS_MODE_RAW);
   if(tr == NULL){
@@ -1371,12 +1364,12 @@ int word_read_cmd(struct katcp_dispatch *d, int argc)
       flags |= KATCP_FLAG_LAST;
     }
 
-#if TBS_DO_FLIP
-    flip = flip32(value);
-    append_hex_long_katcp(d, flags, flip);
-#else
-    append_hex_long_katcp(d, flags, value);
-#endif
+    if(platform_do_flip_tbs()){
+      flip = flip32(value);
+      append_hex_long_katcp(d, flags, flip);
+    } else {
+      append_hex_long_katcp(d, flags, value);
+    }
   }
 
 #if 0
@@ -1927,7 +1920,7 @@ int finalise_cmd(struct katcp_dispatch *d, int argc)
   switch(tr->r_fpga){
     case TBS_FPGA_PROGRAMMED :
       if(map_raw_tbs(d) < 0){
-        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map %s", TBS_FPGA_MEM);
+        log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map %s", current_platform_tbs()->p_fpga_mem);
         return KATCP_RESULT_FAIL;
       }
       status_fpga_tbs(d, TBS_FPGA_MAPPED);
@@ -2643,6 +2636,7 @@ int fixup_offset_tbs(struct katcp_dispatch *d, void *global, char *key, void *da
 int map_raw_tbs(struct katcp_dispatch *d)
 {
   struct tbs_raw *tr;
+  const struct tbs_platform *platform;
   unsigned int page;
 #ifdef __PPC__
   unsigned int power, window;
@@ -2659,6 +2653,7 @@ int map_raw_tbs(struct katcp_dispatch *d)
   if(tr == NULL){
     return -1;
   }
+  platform = current_platform_tbs();
 
   switch(tr->r_fpga){
     case TBS_FPGA_PROGRAMMED  :
@@ -2718,18 +2713,21 @@ int map_raw_tbs(struct katcp_dispatch *d)
 
 #endif
 
-  fd = open(TBS_FPGA_MEM, O_RDWR);
+  if(platform->p_map_size > 0){
+    tr->r_map_offset = platform->p_map_base;
+    tr->r_map_size = platform->p_map_size;
+  }
+
+  fd = open(platform->p_fpga_mem, O_RDWR);
   if(fd < 0){
-    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open file %s: %s", TBS_FPGA_MEM, strerror(errno));
+    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open file %s: %s", platform->p_fpga_mem, strerror(errno));
     return -1;
   }
 
-  tr->r_map_offset = 0xFF200000;
-  tr->r_map_size = 0x10000;
   tr->r_map = mmap(NULL, tr->r_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tr->r_map_offset);
 
   if(tr->r_map == MAP_FAILED){
-    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map file %s: %s", TBS_FPGA_MEM, strerror(errno));
+    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map file %s: %s", platform->p_fpga_mem, strerror(errno));
     close(fd);
     return -1;
   }
@@ -2744,6 +2742,7 @@ int map_raw_tbs(struct katcp_dispatch *d)
 int stop_fpga_tbs(struct katcp_dispatch *d)
 {
   struct tbs_raw *tr;
+  const struct tbs_platform *platform;
   int dfd, result;
 
   tr = get_mode_katcp(d, TBS_MODE_RAW);
@@ -2751,6 +2750,7 @@ int stop_fpga_tbs(struct katcp_dispatch *d)
     log_message_katcp(d, KATCP_LEVEL_FATAL, NULL, "unable to acquire state");
     return -1;
   }
+  platform = current_platform_tbs();
 
   result = 0;
 
@@ -2767,14 +2767,13 @@ int stop_fpga_tbs(struct katcp_dispatch *d)
   if(tr->r_fpga == TBS_FPGA_PROGRAMMED){
     log_message_katcp(d, KATCP_LEVEL_DEBUG, NULL, "should deprogram fpga");
 
-#ifdef __PPC__
-    dfd = open(TBS_FPGA_CONFIG, O_WRONLY);
-#else
-    /* for debugging */
-    dfd = open(TBS_FPGA_CONFIG, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-#endif
+    if(platform->p_use_fpga_manager){
+      dfd = open(platform->p_fpga_config, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    } else {
+      dfd = open(platform->p_fpga_config, O_WRONLY);
+    }
     if(dfd < 0){
-      log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open %s: %s", TBS_FPGA_CONFIG, strerror(errno));
+      log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open %s: %s", platform->p_fpga_config, strerror(errno));
       result = (-1);
     } else {
       status_fpga_tbs(d, TBS_FPGA_DOWN);
@@ -2841,7 +2840,7 @@ int start_fpg_tbs(struct katcp_dispatch *d)
   tr->r_top_register = infer_fpga_range(d);
 
   if(map_raw_tbs(d) < 0){
-    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map %s", TBS_FPGA_MEM);
+    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to map %s", current_platform_tbs()->p_fpga_mem);
     return -1;
   }
 #endif
@@ -2879,12 +2878,15 @@ int start_fpg_tbs(struct katcp_dispatch *d)
 int start_bof_tbs(struct katcp_dispatch *d, struct bof_state *bs)
 {
   struct tbs_raw *tr;
+  const struct tbs_platform *platform;
+  FILE *fpga_man;
 
   tr = get_mode_katcp(d, TBS_MODE_RAW);
   if(tr == NULL){
     log_message_katcp(d, KATCP_LEVEL_FATAL, NULL, "unable to acquire state");
     return -1;
   }
+  platform = current_platform_tbs();
 
   if((tr->r_registers)){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "fpga seems already programmed");
@@ -2897,9 +2899,19 @@ int start_bof_tbs(struct katcp_dispatch *d, struct bof_state *bs)
     return -1;
   }
 
-  if(program_bof(d, bs, TBS_FPGA_CONFIG) < 0){
-    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to program bit stream to %s", TBS_FPGA_CONFIG);
+  if(program_bof(d, bs, platform->p_fpga_config) < 0){
+    log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to program bit stream to %s", platform->p_fpga_config);
     return -1;
+  }
+
+  if(platform->p_use_fpga_manager){
+    fpga_man = fopen(platform->p_fpga_manager_fw, "w");
+    if(fpga_man == NULL){
+      log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open %s: %s", platform->p_fpga_manager_fw, strerror(errno));
+      return -1;
+    }
+    fprintf(fpga_man, "%s\n", platform->p_firmware_name);
+    fclose(fpga_man);
   }
 
   status_fpga_tbs(d, TBS_FPGA_PROGRAMMED);
@@ -3035,7 +3047,7 @@ int make_bofdir_tbs(struct katcp_dispatch *d, struct tbs_raw *tr, char *bofdir)
 
 int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv)
 {
-  fprintf(stderr, "DEBUG_RAW: Inside setup_raw_tbs\n");
+  TBS_DEBUGF("DEBUG_RAW: Inside setup_raw_tbs\n");
   struct tbs_raw *tr;
   int result;
 #if 0
@@ -3125,7 +3137,7 @@ int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv)
   bus_error_happened = 0;
 
   result = 0;
-  fprintf(stderr, "DEBUG_RAW: Registering tcpborphserver commands\n");
+  TBS_DEBUGF("DEBUG_RAW: Registering tcpborphserver commands\n");
   result += register_flag_mode_katcp(d, "?finalise",     "mark register definitions as complete (?finalise)", &finalise_cmd, 0, TBS_MODE_RAW);
 
   result += register_flag_mode_katcp(d, "?phyprog",      "programs firmware onto phy chip on mezzanine card (?phyprog mezzanine_card phy_number [file <filename>] [force])", &phy_prog_cmd, 0, TBS_MODE_RAW);
@@ -3194,4 +3206,3 @@ int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv)
 
   return result;
 }
-

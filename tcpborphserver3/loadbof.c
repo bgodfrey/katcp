@@ -388,10 +388,11 @@ struct bof_state *open_bof(struct katcp_dispatch *d, char *name)
   return open_bof_fd(d, fd);
 }
 
-int program_bof(struct katcp_dispatch *d, struct bof_state *bs, char *device)
+int program_bof(struct katcp_dispatch *d, struct bof_state *bs, const char *device)
 {
 #define BUFFER 4096
   int dfd, rr, wr, can, need, have;
+  const struct tbs_platform *platform;
   char buffer[BUFFER];
 #if 0
   if(lseek(bs->b_fd, bs->b_bit_offset, SEEK_SET) != (bs->b_bit_offset)){
@@ -401,12 +402,12 @@ int program_bof(struct katcp_dispatch *d, struct bof_state *bs, char *device)
     return -1;
   }
 
-#ifdef __PPC__
-  dfd = open(device, O_WRONLY);
-#else
-  /* for debugging, simply write out the bitstream */
-  dfd = open(device, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-#endif
+  platform = current_platform_tbs();
+  if(platform->p_use_fpga_manager){
+    dfd = open(device, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+  } else {
+    dfd = open(device, O_WRONLY);
+  }
   if(dfd < 0){
     log_message_katcp(d, KATCP_LEVEL_ERROR, NULL, "unable to open device %s: %s", device, strerror(errno));
     return -1;

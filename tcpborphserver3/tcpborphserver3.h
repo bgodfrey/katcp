@@ -10,7 +10,12 @@
 
 #define TBS_MODE_RAW        0 
 #define TBS_MODE_RAW_NAME  "raw"
-#define USE_FPGA_MANAGER 1
+
+#ifdef DEBUG
+#define TBS_DEBUGF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define TBS_DEBUGF(...) do { } while(0)
+#endif
 
 #ifdef DEBUG
 #define TBS_LOGFILE        "tcpborphserver3.log"
@@ -18,37 +23,10 @@
 #define TBS_LOGFILE        "/var/log/tcpborphserver3.log"
 #endif
 
-
-//#ifdef __PPC__ /* check for PPC roach */
-//#define TBS_DO_FLIP        0
-//#define TBS_FPGA_CONFIG    "/dev/roach/config"
-//#define TBS_FPGA_MEM       "/dev/roach/mem"
-//#elif defined(__ARM_ARCH_7A__) /* check for arm 7 (red pitaya board zync soc)  */
-//#define TBS_DO_FLIP        1
-//#define TBS_FPGA_CONFIG    "/dev/xdevcfg"
-//#define TBS_FPGA_MEM       "/dev/mem"
-//#elif defined(__ARM_ARCH_8A__) || defined(USE_FPGA_MANAGER)  /* check for arm 8 (zynq ultrascal mpsoc)*/
-//#define TBS_DO_FLIP        0
-//#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
-//#define TBS_FPGA_MEM       "/dev/mem"
-//#define FPGA_MANAGER_FLAG  "/sys/class/fpga_manager/fpga0/flags"
-//#define FPGA_MANAGER_FW    "/sys/class/fpga_manager/fpga0/firmware"
-//#else
-//#define TBS_DO_FLIP        0
-//#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.bin"
-//#define TBS_FPGA_MEM       "/dev/mem"
-//#endif
-
-
-#define TBS_DO_FLIP        0
-#define TBS_FPGA_CONFIG    "/lib/firmware/tcpborphserver.rbf"
-#define TBS_FPGA_MEM       "/dev/mem"
 #define FPGA_MANAGER_FLAG  "/sys/class/fpga_manager/fpga0/flags"
 #define FPGA_MANAGER_FW    "/sys/class/fpga_manager/fpga0/firmware"
 #define TBS_KCPFPG_PATH    "/bin/kcpfpg"
-#define TBS_RAMFILE_PATH   "/dev/shm/gateware"
-#define TBS_RAMFILE_PATH_XILINX "/dev/shm/gateware"
-#define TBS_RAMFILE_PATH_INTEL  "/lib/firmware/tcpborphserver.rbf"
+#define TBS_RAMFILE_PATH_AMD    "/dev/shm/gateware"
 
 #define TBS_FPGA_STATUS    "#fpga"
 #define TBS_KCPFPG_EXE     "kcpfpg"
@@ -59,6 +37,31 @@
 #define TBS_ROACH_PARTIAL_MAP  (32*1024*1024)
 /* on a 2Gb kernel / 2G user split, we can see the full bank EPB of 128M */
 #define TBS_ROACH_FULL_MAP     (128*1024*1024)
+
+enum tbs_vendor {
+  TBS_VENDOR_AMD,
+  TBS_VENDOR_INTEL
+};
+
+struct tbs_platform {
+  enum tbs_vendor p_vendor;
+  const char *p_name;
+  const char *p_fpga_config;
+  const char *p_fpga_mem;
+  const char *p_ramfile_path;
+  const char *p_firmware_name;
+  const char *p_fpga_manager_flag;
+  const char *p_fpga_manager_fw;
+  unsigned int p_map_base;
+  unsigned int p_map_size;
+  int p_use_fpga_manager;
+  int p_do_flip;
+};
+
+const struct tbs_platform *current_platform_tbs(void);
+int platform_is_intel_tbs(void);
+int platform_use_fpga_manager_tbs(void);
+int platform_do_flip_tbs(void);
 
 int setup_raw_tbs(struct katcp_dispatch *d, char *bofdir, int argc, char **argv);
 
