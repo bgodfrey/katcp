@@ -7,6 +7,53 @@ The Makefile.inc file in this directory contains a number of options,
 edit to your needs. Then type make to build it. You probably wish to
 do a make install on a per subdirectory basis
 
+Building:
+
+  Build the katcp library first, then the programs that use it:
+
+    make -C katcp
+    make -C fpg
+    make -C tcpborphserver3
+
+  Install the tcpborphserver3 daemon and kcpfpg helper on the target:
+
+    make -C tcpborphserver3 install
+    make -C fpg install
+
+  tcpborphserver3 runs /bin/kcpfpg when programming .fpg files. If your
+  install prefix does not put kcpfpg in /bin, install or copy it there:
+
+    install -m 0755 fpg/kcpfpg /bin/kcpfpg
+
+  Cross-compilation uses the standard CROSS_COMPILE prefix from Makefile.inc.
+  For example, when building on a host for a 32-bit ARM Linux target:
+
+    make -C katcp CROSS_COMPILE=arm-linux-gnueabihf-
+    make -C fpg CROSS_COMPILE=arm-linux-gnueabihf-
+    make -C tcpborphserver3 CROSS_COMPILE=arm-linux-gnueabihf-
+
+Intel / SoCFPGA platforms:
+
+  No Intel-specific CFLAGS are required. The FPGA backend is selected at
+  runtime. On boards with a useful /proc/device-tree/compatible entry,
+  tcpborphserver3 and kcpfpg should auto-detect Intel SoCFPGA systems.
+
+  To force the Intel backend, export either of these before running
+  tcpborphserver3 or kcpfpg:
+
+    export KATCP_FPGA_PLATFORM=intel
+    export KATCP_FPGA_VENDOR=intel
+
+  The Intel backend writes the bitstream to /lib/firmware/tcpborphserver.rbf
+  and triggers Linux FPGA Manager via:
+
+    /sys/class/fpga_manager/fpga0/firmware
+
+  Make sure the FPGA bridges are enabled before accessing mapped registers.
+  On DE10-Nano systems this is commonly:
+
+    echo 1 > /sys/class/fpga_bridge/*/enable
+
 Most executables understand a -h option which provides some (terse) help
 
 General purpose components:
