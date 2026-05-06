@@ -69,7 +69,7 @@ static int compatible_contains(const char *needle)
 {
   FILE *f;
   char buffer[512];
-  size_t got;
+  size_t got, needle_len, i;
 
   f = fopen("/proc/device-tree/compatible", "rb");
   if(f == NULL){
@@ -79,8 +79,18 @@ static int compatible_contains(const char *needle)
   got = fread(buffer, 1, sizeof(buffer) - 1, f);
   fclose(f);
 
-  buffer[got] = '\0';
-  return strstr(buffer, needle) != NULL;
+  needle_len = strlen(needle);
+  if(needle_len == 0 || got < needle_len){
+    return 0;
+  }
+
+  for(i = 0; i <= got - needle_len; i++){
+    if(!memcmp(buffer + i, needle, needle_len)){
+      return 1;
+    }
+  }
+
+  return 0;
 }
 
 static const struct tbs_platform *platform_from_name(const char *name)
