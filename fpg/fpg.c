@@ -76,6 +76,75 @@ struct ipr_state{
   unsigned int i_timeout;
 };
 
+static int buffer_contains_bytes(const char *buffer, size_t size, const char *needle)
+{
+  size_t i, needle_len;
+
+  needle_len = strlen(needle);
+  if((needle_len == 0) || (size < needle_len)){
+    return 0;
+  }
+
+  for(i = 0; i <= size - needle_len; i++){
+    if(!memcmp(buffer + i, needle, needle_len)){
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int name_is_intel_platform(const char *name)
+{
+  if(name == NULL){
+    return 0;
+  }
+
+  return (!strcmp(name, "intel") || !strcmp(name, "socfpga") || !strcmp(name, "de10"));
+}
+
+static int running_on_intel_platform(void)
+{
+  const char *env;
+  FILE *f;
+  char buffer[512];
+  size_t got;
+
+  env = getenv("KATCP_FPGA_PLATFORM");
+  if(name_is_intel_platform(env)){
+    return 1;
+  }
+
+  env = getenv("KATCP_FPGA_VENDOR");
+  if(name_is_intel_platform(env)){
+    return 1;
+  }
+
+  f = fopen("/proc/device-tree/compatible", "rb");
+  if(f == NULL){
+    return 0;
+  }
+
+  got = fread(buffer, 1, sizeof(buffer), f);
+  fclose(f);
+
+  return buffer_contains_bytes(buffer, got, "altr,socfpga") ||
+         buffer_contains_bytes(buffer, got, "intel,socfpga");
+}
+
+static int should_skip_request(const char *request)
+{
+  if(request == NULL){
+    return 0;
+  }
+
+  if(running_on_intel_platform() && !strncmp(request, "?alveo-", 7)){
+    return 1;
+  }
+
+  return 0;
+}
+
 static int dispatch_client(struct ipr_state *ipr, char *name, unsigned int timeout)
 {
   fd_set fsr, fsw;
@@ -842,6 +911,9 @@ int main(int argc, char **argv)
 
       if(!strcmp(request, UPLOAD_CMD)){
         log_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "skipping %s as handled previously", UPLOAD_CMD);
+        fail = 0;
+      } else if(should_skip_request(request)){
+        log_message_katcl(ipr->i_print, KATCP_LEVEL_DEBUG, ipr->i_label, "skipping platform-specific request %s", request);
         fail = 0;
       } else if(request[0] != KATCP_REQUEST){
         log_message_katcl(ipr->i_print, KATCP_LEVEL_TRACE, ipr->i_label, "not sending %s as not a request", request);

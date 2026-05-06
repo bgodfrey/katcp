@@ -335,6 +335,7 @@ int transfer_status_tbs(struct katcp_dispatch *d, struct katcp_notice *n)
     return -1;
   }
   TBS_DEBUGF("\tDEBUG: Raw KATCP response from job:\n");
+#ifdef DEBUG
   for (int i = 0; i < 5; i++) {
     char *s = get_string_parse_katcl(px, i);
     if(s){
@@ -343,6 +344,7 @@ int transfer_status_tbs(struct katcp_dispatch *d, struct katcp_notice *n)
       fprintf(stderr, "\t\t  px[%d] = NULL\n", i);
     }
   }
+#endif
 
   inform = get_string_parse_katcl(px, 0);
   TBS_DEBUGF("\tDEBUG: Received inform %s\n", inform);
